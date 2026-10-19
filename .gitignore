@@ -1,11 +1,12 @@
 # build output
+*.dSYM/
 *.o
-/build/
 .DS_Store
+/build/
+bench/cooper-go
+bench/cooper-linear
+bench/cooper-objcsp
 csptest
 csptest-tsan
-*.dSYM/
 fanout
-bench/cooper-go
-bench/cooper-objcsp
-bench/cooper-linear
+libcsp.a

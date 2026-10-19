@@ -22,11 +22,31 @@ Files:
 	           versions of the same job (cd bench; make) -- see
 	           Performance
 
-	A client file imports CSP.h -- after any other headers, because
-	alt and otherwise are macros and would rewrite those words in
-	anything imported later -- and compiles with CSP.m:
+	The deliverable is a static library, libcsp.a, and its header,
+	CSP.h. Build and install once:
 
-	    clang -fobjc-arc -o prog prog.m CSP.m -framework Foundation
+	    make
+	    sudo make install       # libcsp.a to /usr/local/lib,
+	                            # CSP.h to /usr/local/include
+
+	(sudo because /usr/local is owned by root here. Not /usr/lib:
+	System Integrity Protection makes it read-only, even to sudo.
+	make uninstall removes both files.)
+
+	clang and the linker search /usr/local/include and
+	/usr/local/lib on their own, so a client needs no path flags.
+	It imports CSP.h -- after any other headers, because alt and
+	otherwise are macros and would rewrite those words in anything
+	imported later -- and links the library:
+
+	    #import "CSP.h"
+
+	    clang -fobjc-arc -o prog prog.m -lcsp -framework Foundation
+
+	The library's code is copied into prog when it's built, so prog
+	runs anywhere with nothing installed. After a new make install,
+	rebuild a program to pick up the new library. ARC is required
+	(-fobjc-arc; Xcode's default).
 
 
 Processes:
@@ -306,7 +326,7 @@ Left out, on purpose:
 	A scheduler multiplexing processes over a few threads, the way
 	Go does. Left out at first as only worth it past ~2,000 live
 	processes -- but see Performance: it is also what small
-	processes need. Now an open question.
+	processes need. Now designed -- see The scheduler.
 
 	Channels of plain C values (Chan of int). Box ints as @(j);
 	make structs into small classes, or carry existing C structs
@@ -377,7 +397,7 @@ Performance, 2026-10-18 -- the COOPER benchmark:
 	expensive for many tiny processes, which is exactly the "let
 	'em rip" style: start one per piece of work, never a pool.
 
-	The two fixes, still to decide:
+	The two fixes considered (chosen: the scheduler):
 
 	thread reuse     a finished process's thread parks, and the
 	                 next go() takes it. Small and safe. But it
@@ -394,6 +414,216 @@ Performance, 2026-10-18 -- the COOPER benchmark:
 	                 channels (a file read, sleep, a lock) stalls
 	                 one of the 8 threads. Timers move into the
 	                 scheduler.
+
+
+The scheduler -- design, 2026-10-18 (not built yet):
+
+	Goal: let 'em rip at Go's cost. One process per piece of work,
+	thousands at once, using every core -- with client code exactly
+	as it is now.
+
+	The idea. A process becomes a coroutine: its own stack and a
+	saved set of CPU registers. A few worker threads, one per core,
+	run them. When a process waits on a channel, its worker saves
+	its registers and loads another runnable process's -- a switch
+	in user space, no kernel involved. How Go does it.
+
+	All cores from the start. A single-thread version (libmill's
+	choice, which dodges the hard parts) was considered and
+	dropped: a CSP runtime that doesn't use every core isn't worth
+	having.
+
+	The parts:
+
+	context switch   save one process's registers and stack
+	                 pointer, load another's. Hand-written per CPU
+	                 type -- ~20 lines on Intel; Apple Silicon gets
+	                 its own. Not ucontext: deprecated, and a kernel
+	                 call per switch.
+
+	stacks           1 MB per process, reserved address space --
+	                 real memory only for pages touched, a few KB
+	                 for most. A guard page below each, so an
+	                 overflow stops at once, with a clear message:
+	                 "process stack overflow (1 MB)". No growth as
+	                 in Go: C keeps raw pointers into its stack. The
+	                 2,048-process cap goes away.
+
+	workers          one per core, counted at startup
+	                 (activeProcessorCount). CSP_MAXPROCS=n
+	                 overrides, as GOMAXPROCS does.
+
+	channels         unchanged in logic. Today a blocked process
+	                 sleeps on a semaphore and whoever completes it
+	                 signals; under the scheduler "sleep" becomes
+	                 "switch to another process" and "signal"
+	                 becomes "put it back on the run queue". Waiters,
+	                 claims, alt and close stay as they are.
+
+	timers           after and sleepFor deadlines in one sorted
+	                 list; an idle worker sleeps until the earliest.
+
+	main             not a coroutine. When main (or any plain
+	                 thread) blocks on a channel it uses today's
+	                 semaphore path. Both paths coexist.
+
+	The spike -- does Objective-C allow it at all? The go/no-go
+	question was autorelease pools. The runtime keeps a pool stack
+	per thread; coroutines interleave on threads and move between
+	them. Tested outside the library, macOS 12, Intel:
+
+	    the pool stack is one pointer in one thread-local slot
+	        (slot 43 here); nothing else about pools is per-thread
+	    without swapping it per coroutine, two coroutines
+	        interleaving pools on one thread abort the runtime:
+	        "autorelease pool page corrupted"
+	    swapping it on every switch: 0 failures over 100 rounds --
+	        half with every step on a brand-new thread (a pool
+	        opened on one thread, filled on another, closed on a
+	        third; 3,000 objects per pool, several pages) -- and
+	        clean under the runtime's own pool debugging modes
+	    a switch costs 11.6 ns; the pool swap adds ~0.1 ns.
+	        Today's thread wake costs several microseconds.
+
+	The slot number is private to the runtime, so it is found at
+	startup, never hard-coded: on a throwaway thread, open a pool
+	and autorelease an object; the pool slot is the one whose value
+	is the start of the page holding a fresh push token. Exactly
+	one match, then a swap test on it -- open a pool on a swapped-in
+	empty stack, swap back, check the original pool still frees its
+	object. Any failure: fall back to a thread per process, with a
+	one-line warning.
+
+
+The hazards, and what was decided:
+
+	1. A lock held across a channel operation. A process can pause
+	   holding it and continue on another worker: unlocking from
+	   the wrong thread, deadlock, or -- with @synchronized and
+	   recursive locks -- two processes inside at once.
+	   Decided: a rule. Don't hold a lock across a channel
+	   operation; share by communicating. No library lock --
+	   channels collect results, and that's all this style needs.
+	   Foundation's own locks are safe: taken and released inside
+	   one call.
+
+	2. Blocking outside the channels -- sleep, a file read, a
+	   network call. It stops the whole worker, not just the
+	   process; if all workers wait on something another process
+	   must do, everything stops.
+	   Decided: a monitor thread, as Go has. When a worker has run
+	   one process for ~10 ms and the kernel says that thread is
+	   waiting, the monitor starts an extra worker. Blocking calls
+	   just work -- read the file right there in the process. Plus
+	   sleepFor(seconds), which pauses only the process.
+
+	3. "The current thread" changes mid-function. A process can
+	   start on one worker and continue on another: [NSThread
+	   currentThread], thread-locals, run-loop timers (NSTimer,
+	   afterDelay:) belong to whichever worker it is on -- and
+	   run-loop timers in a process never fire.
+	   Decided: the library reads its own per-process bookkeeping
+	   in a way the compiler can't cache across a switch. The rule:
+	   don't depend on which thread you're on; for timing use after
+	   and sleepFor. errno is fine read right after the call that
+	   set it.
+
+	4. Exceptions. The runtime keeps per-thread state while an
+	   exception is being caught.
+	   Decided: a rule -- no channel operations inside @catch or
+	   @finally -- and a check that stops with a clear message if
+	   it's cheap to make. An uncaught exception stops the program,
+	   as today and as Go's panic does.
+
+	5. A private runtime detail -- the pool slot.
+	   Decided: discovered and verified at startup, as above, with
+	   the fallback.
+
+	6. Fixed-size stacks. Decided as above: 1 MB, guard page,
+	   clear overflow message; a per-process size option if deep
+	   recursion ever needs it.
+
+	7. Debugging. The debugger sees only the workers, not the
+	   processes.
+	   Decided:
+	       deadlock detection, as Go: when every process, main
+	           included, waits on a channel and no timer is
+	           pending, stop with "all processes are asleep --
+	           deadlock!" and what each was waiting on. Today's
+	           thread version just hangs.
+	       ctrl-\ prints every process, what it waits on, and
+	           where it was started
+	       CSP_DEBUG=threads runs every process as a real thread
+	           again, so the ordinary debugger sees them all
+	       ThreadSanitizer's coroutine hooks for the library's
+	           own race tests
+
+	8. No preemption. A process gives up its worker only when it
+	   pauses or finishes, so a long computation keeps its core.
+	   Decided: none, as before Go 1.14. The monitor asks the
+	   kernel whether a busy worker is waiting or computing, and
+	   adds a worker only for waiting -- 1,000 heavy computations
+	   don't become 1,000 threads. When every core is computing,
+	   others wait their turn and timers can fire late. yield()
+	   for a long computation that wants to share.
+
+
+Settings:
+
+	CSP_MAXPROCS=n       how many cores to use (default: all)
+	CSP_DEBUG=threads    a thread per process, as now -- for
+	                     debugging, not for running
+
+
+Energy:
+
+	What drains a battery is a program that never truly sleeps --
+	waking "just to check", hundreds of times a second. The rule:
+	with nothing to do, every thread sleeps in the kernel. No
+	spinning, no polling.
+
+	idle workers     wait in the kernel. A short spin before
+	                 sleeping (Go's trick, for latency) only while
+	                 other workers are busy -- never when the whole
+	                 program is idle.
+	the monitor      only watches while some worker is running a
+	                 process; when every process waits on a channel
+	                 it sleeps too.
+	timers           one kernel wait, until the earliest deadline.
+	                 A little slack allowed (~1 ms) so macOS can
+	                 coalesce: 100 processes sleeping "about 1 s"
+	                 wake the CPU once, not 100 times.
+	deadlock check   run when the last worker goes idle -- an event,
+	                 not a timer.
+
+	The scheduler should cost less energy than threads: most
+	kernel wakeups -- one per message today -- become user-space
+	switches, and finishing sooner on all cores, then idling, is
+	the efficient pattern on modern CPUs.
+
+	Later, on Apple Silicon: workers inherit the main thread's
+	quality of service, which decides fast cores or efficient
+	ones. A batch job could run on the efficient cores for much
+	less power -- a setting worth adding then.
+
+	To test: a program whose processes all wait on channels shows
+	0 idle wake-ups (top, or Activity Monitor's Energy tab).
+
+
+Building it -- order:
+
+	1. Isolate the sleep-and-wake step in today's code: no change
+	   in behavior, the semaphore behind one interface.
+	2. Coroutines and workers on all cores, with pool swapping and
+	   slot discovery. main keeps the semaphore path.
+	3. Timers, sleepFor, yield.
+	4. The monitor.
+	5. Deadlock detection, the ctrl-\ dump, CSP_DEBUG=threads.
+	6. The COOPER benchmark again, against Go; the idle-wakeups
+	   test; the full test suite in both modes.
+
+	Apple Silicon after that: its own switch, slot access and stack
+	setup -- a few dozen lines; everything else shared.
 
 
 Memory, 2026-10-18:

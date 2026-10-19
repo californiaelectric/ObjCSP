@@ -8,9 +8,25 @@ The goal: push the complexity into the library. A client source
 file should read as plainly as Go -- easily read process
 definitions, easily read invocations, no block syntax.
 
-Status, 2026-10-18: designed, not yet built. Everything below is
-the intended behavior. Items marked UNVERIFIED depend on a compiler
-detail still to be tested.
+Status, 2026-10-18: built. Everything below is implemented; what is
+tested is listed under Verified, at the end.
+
+
+Files:
+
+	CSP.h      the library: everything a client file uses
+	CSP.m      the implementation
+	test.m     the tests (make check; make tsan for the race checker)
+	fanout.m   a distributed worker written as a client (make fanout)
+	bench/     the COOPER benchmark: Go, ObjCSP and linear ObjC
+	           versions of the same job (cd bench; make) -- see
+	           Performance
+
+	A client file imports CSP.h -- after any other headers, because
+	alt and otherwise are macros and would rewrite those words in
+	anything imported later -- and compiles with CSP.m:
+
+	    clang -fobjc-arc -o prog prog.m CSP.m -framework Foundation
 
 
 Processes:
@@ -28,8 +44,19 @@ Processes:
 
 	    go(scoreWords(text, v, scores));
 
-	As in Go, the arguments are evaluated when go runs, so each
-	process started in a loop gets that iteration's values.
+	The variables in the call are captured when go runs, so each
+	process started in a loop gets that iteration's values. One
+	difference from Go: a function call inside the arguments, like
+	go(work([c receive])), runs in the new process, not before it
+	starts. Do the call first, into a variable, and pass that.
+
+	go({ ... }) runs a block of statements as a process -- Go's
+	go func() { ... }():
+
+	    go({
+	        for (int i = 0; i < n; i++) [jobs send:@(i)];
+	        [jobs close];
+	    });
 
 	Each process is its own thread, and the threads spread across
 	all cores. A blocked process -- waiting on a channel -- uses no
@@ -166,9 +193,8 @@ alt -- Go's select:
 
 	receive(x, c) { }   a value arrived on c. x is declared for
 	                    you, typed from the channel, scoped to the
-	                    body. (UNVERIFIED: the typing relies on
-	                    clang's __typeof__ seeing Chan<T>'s type.)
-	                    On a closed channel this fires with x nil.
+	                    body. On a closed channel this fires with
+	                    x nil.
 
 	sending(c, v) { }   v was delivered on c. The body is often
 	                    empty -- delivering was the point.
@@ -181,6 +207,17 @@ alt -- Go's select:
 	A body is ordinary code. return returns from the enclosing
 	function. break ends the case only, not a surrounding loop --
 	the same trap as Go; use a flag to leave a loop.
+
+	Every case must be written directly inside the alt -- not
+	inside an if. (alt runs its body twice, first to learn the
+	cases, then to run the chosen one; a case that appears on only
+	one pass confuses it.) A case's channel and value are evaluated
+	once.
+
+	A case on a nil channel is never ready, as in Go: setting a
+	channel variable to nil switches its case off.
+
+	alt {} with no cases waits forever, as Go's select {} does.
 
 	Named alt, occam's word, because select is already a POSIX
 	function.
@@ -261,7 +298,9 @@ Left out, on purpose:
 	closed.
 
 	A scheduler multiplexing processes over a few threads, the way
-	Go does. Only worth it past ~2,000 live processes.
+	Go does. Left out at first as only worth it past ~2,000 live
+	processes -- but see Performance: it is also what small
+	processes need. Now an open question.
 
 	Channels of plain C values (Chan of int). Box ints as @(j);
 	make structs into small classes, or carry existing C structs
@@ -290,13 +329,108 @@ Decisions, 2026-10-18:
 	    class cluster); it adds a runtime type check.
 
 
-To verify once built:
+Performance, 2026-10-18 -- the COOPER benchmark:
 
-	unbuffered send really waits for the receiver
-	close: drain, then nil; errors on send-after-close and
-	    double close
-	alt: every case kind, random choice among ready cases,
-	    after's timing, receive on a closed channel
-	receive(x, c) typing x from Chan<T> via __typeof__
-	Parcel: round trip, and the wrong-type error
-	~2,000 processes live at once
+	The job: a 1,000-character lowercase lorem ipsum block. 1,000
+	processes each take it from a channel, overwrite 5 random
+	spots with "COOPER", and send it back on a second channel;
+	main collects all 1,000 and writes them to /dev/null. The
+	same job three ways, in bench/:
+
+	    cooper.go    Go, goroutines
+	    cooper.m     ObjCSP, line for line with the Go
+	    linear.m     ObjC, 1,000 plain calls on main
+
+	All three checked first: 1,000 distinct blocks of exactly
+	1,000 characters. (Some show 3 or 4 COOPERs, not 5: a random
+	spot can land on an earlier one.)
+
+	One trial, median ms (5 runs x 21 trials, this Mac: 8 cores,
+	Intel, macOS 12; Go 1.19):
+
+	                     cold    warm    whole program, 21 trials
+	    Go               2.9     2.2      51 ms
+	    ObjCSP          23.6    21.6     592 ms
+	    ObjC linear      5.5     4.4     107 ms
+
+	ObjCSP is about 10x slower than Go and 5x slower than doing
+	the work in a straight line. Where its 21 ms goes, warm:
+
+	    spawn     ~9.5 ms   creating 1,000 kernel threads, ~9.5 us each
+	    send      ~2.7 ms   each handoff wakes a sleeping thread
+	    collect   ~9.5 ms   each take wakes the sender's thread so it
+	                        can finish and exit
+
+	Each block is about 4 us of work. ObjCSP spends about 20 us of
+	kernel time per process around it: creating a thread, and
+	waking one for every message. Go does both in user space.
+	Spare cores can't win that back when the work is this small.
+
+	Threads are fine when each process does real work -- scoring
+	a story takes far longer than starting a thread. They are
+	expensive for many tiny processes, which is exactly the "let
+	'em rip" style: start one per piece of work, never a pool.
+
+	The two fixes, still to decide:
+
+	thread reuse     a finished process's thread parks, and the
+	                 next go() takes it. Small and safe. But it
+	                 can't help here: all 1,000 processes are alive
+	                 at once, so 1,000 threads must exist. It helps
+	                 programs that start processes over time.
+
+	a scheduler      processes become coroutines with small stacks,
+	                 run by ~8 threads, one per core; a blocked
+	                 process switches to another in user space.
+	                 How Go does it, and the real fix -- client
+	                 code unchanged. The cost: hand-written context
+	                 switching, and a process blocking outside our
+	                 channels (a file read, sleep, a lock) stalls
+	                 one of the 8 threads. Timers move into the
+	                 scheduler.
+
+
+Known limits:
+
+	A for (x in c) loop left early with break keeps its last value
+	alive -- one object, never freed. Harmless unless done in a
+	loop of its own, many times over.
+
+	The compiler checks receive and send:, but not the value in a
+	sending(c, v) case; a wrong type there is caught nowhere.
+
+	Two anonymous structs with the same fields look like the same
+	type to a Parcel. Give a struct a tag name (typedef struct
+	Sample { ... } Sample) and the check can tell them apart.
+
+
+Verified, 2026-10-18 (test.m, 47 checks; 100 runs clean, and clean
+under ThreadSanitizer):
+
+	unbuffered send waits for the receiver
+	buffered channels: FIFO order, capacity
+	close: drain, then nil; a waiting receiver gets nil; errors on
+	    send-after-close, double close, and sending nil -- which
+	    the compiler also warns about
+	for-in as a work queue: 4 workers, 1,000 values, each once
+	alt: random choice among ready cases (about 50/50 over 1,000);
+	    otherwise only when nothing is ready; a nil channel's case
+	    never fires; after's timing
+	    (0.200-0.205 s for 0.2); sending; deliver-or-stop; receive
+	    on a closed channel fires with nil; return from a case
+	receive(x, c) types x from Chan<T> -- checked at compile time
+	a case that never fires leaves nothing queued, over 5,000 alts
+	Parcel: round trip, the copy, wrong-type and closed-channel
+	    errors; anonymous structs alike, tagged ones told apart
+	1,900 processes live at once: started in about 0.02 s
+	stress: 6 senders, 5 receivers, 3 unbuffered channels, all
+	    through alt -- 18,000 values, each received exactly once;
+	    6 processes offering both sending and receive on one
+	    channel -- sends and receives balance
+
+	The first stress runs failed about one in three: each process
+	reported two numbers as two sends on a shared channel, and
+	reports from different processes interleaved. A test bug, not
+	a library one -- the fix was one message per report. Worth
+	remembering as a pattern: a reply that must stay together goes
+	in one message.

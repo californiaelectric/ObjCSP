@@ -2,3 +2,10 @@
 *.o
 /build/
 .DS_Store
+csptest
+csptest-tsan
+*.dSYM/
+fanout
+bench/cooper-go
+bench/cooper-objcsp
+bench/cooper-linear

@@ -18,6 +18,11 @@
 #import <pthread.h>
 #import <stdatomic.h>
 
+// The runtime calls @autoreleasepool { } compiles to; for-in needs a pool
+// that opens in one call and closes in the next.
+void *objc_autoreleasePoolPush(void);
+void objc_autoreleasePoolPop(void *pool);
+
 // A process waiting on one or more channel operations.
 @interface CSPWaiter : NSObject {
 @public
@@ -127,8 +132,13 @@ static void sleepForever(void) {
 // The two operations that don't have to wait, shared by send, receive and
 // alt. Called with the lock held; if they complete another process's
 // entry, it comes back in *woken, to be signalled once the lock is dropped.
+//
+// The out-parameters are __strong on purpose. ARC's default for them is
+// __autoreleasing, which would put every value received, and every entry
+// woken, into the calling thread's autorelease pool -- held until the
+// process ends, out of reach of any pool in the client's loop body.
 
-static BOOL tryReceive(Chan *c, id _Nullable *out, CSPEntry *_Nullable *woken) {
+static BOOL tryReceive(Chan *c, id _Nullable __strong *out, CSPEntry *_Nullable __strong *woken) {
     if (c->buf.count) {
         *out = c->buf[0];
         [c->buf removeObjectAtIndex:0];
@@ -152,7 +162,7 @@ static BOOL tryReceive(Chan *c, id _Nullable *out, CSPEntry *_Nullable *woken) {
     return NO;
 }
 
-static BOOL trySend(Chan *c, id value, CSPEntry *_Nullable *woken) {
+static BOOL trySend(Chan *c, id value, CSPEntry *_Nullable __strong *woken) {
     CSPEntry *r = dequeue(c->recvq);
     if (r) {
         r->value = value;
@@ -232,19 +242,23 @@ static void raiseClosed(NSString *what) {
     for (CSPEntry *e in woken) wake(e);
 }
 
-// for (x in c): one value per call. The current value is held in
-// state->extra[0] so it stays alive while the loop body uses it; it is
-// released on the next call. (A loop left by break keeps its last value.)
+// for (x in c): one value per call. Each pass of the loop runs in its own
+// autorelease pool, pushed here before the body and popped on the next
+// call, so whatever the body autoreleases is freed every pass and a
+// long-running loop doesn't grow. The value itself is autoreleased into
+// that pool, which keeps it alive while the body uses it. A loop left by
+// break leaves its pool open; the enclosing pool drains it, value and all.
 - (NSUInteger)countByEnumeratingWithState:(NSFastEnumerationState *)state
                                   objects:(id __unsafe_unretained [])buffer
                                     count:(NSUInteger)len {
     if (state->extra[0]) {
-        CFRelease((CFTypeRef)state->extra[0]);
+        objc_autoreleasePoolPop((void *)state->extra[0]);
         state->extra[0] = 0;
     }
     id value = [self receive];
     if (!value) return 0;
-    state->extra[0] = (unsigned long)CFBridgingRetain(value);
+    state->extra[0] = (unsigned long)objc_autoreleasePoolPush();
+    CFAutorelease(CFBridgingRetain(value));
     buffer[0] = value;
     state->itemsPtr = buffer;
     state->mutationsPtr = &state->extra[1];

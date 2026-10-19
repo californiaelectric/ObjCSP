@@ -172,6 +172,12 @@ Close and range:
 	ends. Several processes can range over the same channel; each
 	value goes to exactly one of them. That's a work queue.
 
+	Each pass of the loop runs in its own autorelease pool, drained
+	before the next value is received. A worker can loop over a
+	million jobs without growing, and without an @autoreleasepool
+	of its own. Cost: 2-18 ns a pass, measured with an almost empty
+	body -- nothing next to a channel operation.
+
 	To say "nothing" on a signal channel, where the message itself
 	carries no data, send [NSNull null] on a Chan<NSNull *> -- the
 	equivalent of Go's chan struct{}. Rarely needed.
@@ -390,11 +396,38 @@ Performance, 2026-10-18 -- the COOPER benchmark:
 	                 scheduler.
 
 
-Known limits:
+Memory, 2026-10-18:
 
-	A for (x in c) loop left early with break keeps its last value
-	alive -- one object, never freed. Harmless unless done in a
-	loop of its own, many times over.
+	ARC cleans up everything on the normal paths. Checked with
+	macOS's leaks tool: 0 leaks after the benchmark's 21,000
+	processes. The test suite shows 21 small leaks, ~1 KB, all in
+	tests that throw on purpose (sending nil, a Parcel opened as
+	the wrong type, sending on a closed channel). That is ARC by
+	design: an exception means programmer error, stop the program
+	-- Go's panic -- and ARC doesn't release what it unwinds past.
+
+	What ARC can't collect:
+
+	a process blocked forever -- waiting on a channel nobody will
+	    use again -- keeps its thread, stack and everything it
+	    references until the program exits. Go's goroutine leak;
+	    a program bug, but nothing collects it.
+
+	autoreleased objects in a long-running loop that isn't for-in
+	    over a channel (a while loop, a for over an array). Those
+	    are held until the process ends; wrap the body in
+	    @autoreleasepool { }. for (x in c) does this for you.
+
+	A bug found this way, and fixed: every value received, and
+	every process woken, went into the receiving thread's
+	autorelease pool -- ARC's default for a C function's object
+	out-parameters. For a for-in worker the receive happens
+	outside the loop body, out of reach of any client pool, so it
+	grew ~180 bytes a message until the process ended. Measured
+	over 200,000 jobs: 36 MB before the fix, flat 0.5 MB after.
+
+
+Known limits:
 
 	The compiler checks receive and send:, but not the value in a
 	sending(c, v) case; a wrong type there is caught nowhere.
@@ -404,8 +437,8 @@ Known limits:
 	Sample { ... } Sample) and the check can tell them apart.
 
 
-Verified, 2026-10-18 (test.m, 47 checks; 100 runs clean, and clean
-under ThreadSanitizer):
+Verified, 2026-10-18 (test.m, 50 checks; clean under
+ThreadSanitizer; 100 runs clean):
 
 	unbuffered send waits for the receiver
 	buffered channels: FIFO order, capacity
@@ -413,6 +446,8 @@ under ThreadSanitizer):
 	    send-after-close, double close, and sending nil -- which
 	    the compiler also warns about
 	for-in as a work queue: 4 workers, 1,000 values, each once
+	for-in drains a pool every pass, and break frees the last
+	    value once the enclosing pool drains
 	alt: random choice among ready cases (about 50/50 over 1,000);
 	    otherwise only when nothing is ready; a nil channel's case
 	    never fires; after's timing

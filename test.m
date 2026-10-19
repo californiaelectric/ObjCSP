@@ -138,6 +138,39 @@ static void testRange(void) {
     CHECK(dup == 0);
 }
 
+static void testRangePools(void) {
+    section("for-in: each pass drains its own pool; break frees the last value");
+    Chan<NSNumber *> *c = chan(3);
+    [c send:@1];
+    [c send:@2];
+    [c send:@3];
+    [c close];
+    __weak id previous = nil;
+    int pass = 0, survived = 0;
+    @autoreleasepool {
+        for (NSNumber *n in c) {
+            (void)n;
+            if (pass++ > 0 && previous != nil) survived++;
+            NSObject *o = [NSObject new];
+            previous = o;
+            CFAutorelease(CFBridgingRetain(o));      // held only by this pass's pool
+        }
+    }
+    CHECK(pass == 3);
+    CHECK(survived == 0);
+
+    Chan *d = chan(1);
+    __weak id last = nil;
+    @autoreleasepool {
+        [d send:[NSObject new]];                     // held only by the channel
+        for (id x in d) {
+            last = x;
+            break;
+        }
+    }
+    CHECK(last == nil);
+}
+
 static void testAltRandom(void) {
     section("alt: random choice among ready cases");
     Chan<NSNumber *> *a = chan(1), *b = chan(1);
@@ -399,6 +432,7 @@ int main(void) {
         testRendezvous();
         testClose();
         testRange();
+        testRangePools();
         testAltRandom();
         testOtherwise();
         testAfter();

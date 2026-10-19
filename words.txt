@@ -1,0 +1,302 @@
+ObjCSP
+======
+
+Go-style CSP for Objective-C: processes and channels, in the
+lineage of Hoare (1978), occam (1980s) and Go.
+
+The goal: push the complexity into the library. A client source
+file should read as plainly as Go -- easily read process
+definitions, easily read invocations, no block syntax.
+
+Status, 2026-10-18: designed, not yet built. Everything below is
+the intended behavior. Items marked UNVERIFIED depend on a compiler
+detail still to be tested.
+
+
+Processes:
+
+	A process is an ordinary C function. Nothing special in its
+	definition; it usually takes the channel(s) it answers on.
+
+	    void scoreWords(NSString *t, NSArray<NSString *> *v,
+	                    Chan<WordScore *> *c) {
+	        ...
+	        [c send:r];
+	    }
+
+	go(...) starts one:
+
+	    go(scoreWords(text, v, scores));
+
+	As in Go, the arguments are evaluated when go runs, so each
+	process started in a loop gets that iteration's values.
+
+	Each process is its own thread, and the threads spread across
+	all cores. A blocked process -- waiting on a channel -- uses no
+	CPU and roughly 20-40 KB of memory (estimate, not measured).
+	macOS allows 2,048 threads per program, so plan on at most
+	about 2,000 live processes at once.
+
+	When main returns, the program ends, and any processes still
+	running end with it. Same as Go.
+
+
+Channels:
+
+	A channel is typed by what it carries -- any object type:
+
+	    Chan<NSString *>   *lines   = chan();     // make(chan string)
+	    Chan<WordScore *> *scores  = chan(nv);   // make(chan wordScore, nv)
+	    Chan<Chan<Result *> *> *req = chan();     // channels of channels
+
+	Objects only. An int is sent boxed, @(j), and read back with
+	.intValue. Small numbers cost no allocation (tagged pointers).
+	For a struct, write a small class -- see Structs.
+
+	The type is checked by the compiler. A mismatch is a warning;
+	build with -Werror to make it an error, as in Go. A bare Chan,
+	no <...>, carries anything -- the equivalent of chan any.
+
+	chan()  is unbuffered: send waits until a receiver has taken
+	        the value. The two processes meet.
+	chan(n) is buffered:   send waits only when n values are
+	        already waiting to be received.
+
+
+Send and receive:
+
+	    [c send:r];                   // c <- r
+	    WordScore *s = [c receive];  // s := <-c
+
+	Both wait as long as they have to.
+
+	A channel passes a reference, not a copy. After sending an
+	object, stop changing it -- or send immutable objects
+	(NSString, NSArray) rather than mutable ones.
+
+	nil can't be sent. [c send:nil] is an error. That's what lets
+	nil from receive mean one thing only: closed.
+
+
+Structs:
+
+	Be a good citizen: where Go would use a struct, write a small
+	class, and send objects.
+
+	    @interface Sample : NSObject
+	    @property int day;
+	    @property double weight;
+	    @end
+	    @implementation Sample
+	    @end
+
+	    Chan<Sample *> *c = chan();
+
+	The channel carries your own type name, the compiler checks
+	every send and receive, and fields can be anything -- strings,
+	arrays, other objects -- kept alive properly.
+
+	The escape hatch, for a C struct you already have (from C
+	code, or an Apple API), is a Parcel. It holds a copy of the
+	struct's bytes and remembers which struct type they came from.
+
+	    typedef struct { int day; double weight; } Sample;
+
+	    Chan<Parcel *> *c = chan();
+
+	    [c send:parcelFromStruct(s)];
+	    Sample got = structFromParcel(Sample, [c receive]);
+
+	structFromParcel checks the type: asking for a Sample from a
+	Parcel that holds something else is an error, not garbage.
+
+	The receiver gets its own copy. Unlike an object, a struct
+	sent in a Parcel is not shared, so the sender may go on
+	changing s.
+
+	Plain data only -- ints, doubles, fixed arrays of them. A
+	pointer inside the struct (an NSString *, a char *) is copied
+	as a bare address; what it points to is neither copied nor
+	kept alive. For a struct like that, use a small class instead.
+
+	Both are macros, not methods: a method can't take or return
+	"any struct", a macro can.
+
+	A Parcel channel is Chan<Parcel *> whatever struct it carries,
+	so the compiler can't tell a Sample channel from any other;
+	the check happens when the struct comes out. A per-struct
+	parcel class, checked by the compiler, is a possible later
+	addition.
+
+
+Close and range:
+
+	    [c close];
+
+	Means "no more values." Receivers still get anything already
+	in the channel, then nil from then on. Sending on a closed
+	channel is an error; so is closing one twice.
+
+	    for (NSNumber *j in jobs) {   // for j := range jobs
+	        train(j.intValue);
+	    }
+
+	Receives until the channel is closed and empty, then the loop
+	ends. Several processes can range over the same channel; each
+	value goes to exactly one of them. That's a work queue.
+
+	To say "nothing" on a signal channel, where the message itself
+	carries no data, send [NSNull null] on a Chan<NSNull *> -- the
+	equivalent of Go's chan struct{}. Rarely needed.
+
+
+alt -- Go's select:
+
+	alt waits on several channel operations at once and runs
+	whichever is ready first. If several are ready together, it
+	picks one at random.
+
+	    alt {
+	        receive(r, results) { use(r); }
+	        receive(q, quit)    { stop = YES; }
+	        after(2.0)          { NSLog(@"story timed out"); }
+	    }
+
+	The cases:
+
+	receive(x, c) { }   a value arrived on c. x is declared for
+	                    you, typed from the channel, scoped to the
+	                    body. (UNVERIFIED: the typing relies on
+	                    clang's __typeof__ seeing Chan<T>'s type.)
+	                    On a closed channel this fires with x nil.
+
+	sending(c, v) { }   v was delivered on c. The body is often
+	                    empty -- delivering was the point.
+
+	after(secs) { }     nothing else was ready within secs seconds.
+
+	otherwise { }       nothing is ready right now. With this case
+	                    alt never waits.
+
+	A body is ordinary code. return returns from the enclosing
+	function. break ends the case only, not a surrounding loop --
+	the same trap as Go; use a flag to leave a loop.
+
+	Named alt, occam's word, because select is already a POSIX
+	function.
+
+
+The four alt patterns:
+
+	1. Anything waiting? (e.g. a ctrl-c check between rounds)
+
+	    alt {
+	        receive(s, sigc) { save(); return; }
+	        otherwise        { }
+	    }
+
+	2. Work or stop.
+
+	    for (;;) {
+	        alt {
+	            receive(j, jobs) { train(j.intValue); }
+	            receive(d, done) { return; }
+	        }
+	    }
+
+	3. Timeout.
+
+	    alt {
+	        receive(line, c) { use(line); }
+	        after(2.0)       { NSLog(@"story timed out"); }
+	    }
+
+	4. Deliver or stop. Without alt, [out send:s] would wait
+	   forever if nobody takes s, and never hear quit.
+
+	    for (Story *s in stories) {
+	        alt {
+	            sending(out, s)  { }
+	            receive(q, quit) { return; }
+	        }
+	    }
+
+
+A distributed worker -- fan out, collect the answers:
+
+	Hand each piece of work to its own process; every process
+	answers on one shared channel; collect exactly as many answers
+	as processes were started.
+
+	Go:
+
+	    nv := len(lists)
+	    scores := make(chan wordScore, nv)
+	    for _, v := range lists {
+	        go scoreWords(text, v, scores)
+	    }
+	    for i := 0; i < nv; i++ {
+	        score := <-scores
+	        ...
+	    }
+
+	ObjCSP:
+
+	    NSUInteger nv = lists.count;
+	    Chan<WordScore *> *scores = chan(nv);
+	    for (NSArray<NSString *> *v in lists)
+	        go(scoreWords(text, v, scores));
+	    for (NSUInteger i = 0; i < nv; i++) {
+	        WordScore *score = [scores receive];
+	        ...
+	    }
+
+
+Left out, on purpose:
+
+	Send-only / receive-only channel views (Go's chan<- and
+	<-chan). One plain Chan does everything.
+
+	Go's v, ok := <-c. Not needed: nil can't be sent, so nil means
+	closed.
+
+	A scheduler multiplexing processes over a few threads, the way
+	Go does. Only worth it past ~2,000 live processes.
+
+	Channels of plain C values (Chan of int). Box ints as @(j);
+	make structs into small classes, or carry existing C structs
+	in a Parcel.
+
+
+Decisions, 2026-10-18:
+
+	one thread per process -- memory isn't the constraint; the
+	    2,048-thread cap is
+	short names: Chan, chan, go, alt -- readability over Cocoa's
+	    prefix convention
+	typed channels, any object type
+	nil can't be sent; nil from receive means closed
+	full select, as alt, written with macros rather than blocks --
+	    blocks needed ^(Type *x){ }, __block flags, and couldn't
+	    return from the function
+	timeouts (after) in the first version
+	structs: write a small class and send objects -- the main
+	    path. Parcel kept as the escape hatch for existing C
+	    structs: parcelFromStruct(s),
+	    structFromParcel(Type, p). "Unpack" was rejected -- it
+	    suggests ending up with a richer object, not the same
+	    flat struct. Parcel over Packet: delivery, not networking.
+	    Our own class, not an NSValue subclass (NSValue is a
+	    class cluster); it adds a runtime type check.
+
+
+To verify once built:
+
+	unbuffered send really waits for the receiver
+	close: drain, then nil; errors on send-after-close and
+	    double close
+	alt: every case kind, random choice among ready cases,
+	    after's timing, receive on a closed channel
+	receive(x, c) typing x from Chan<T> via __typeof__
+	Parcel: round trip, and the wrong-type error
+	~2,000 processes live at once

@@ -1,0 +1,4 @@
+# build output
+*.o
+/build/
+.DS_Store

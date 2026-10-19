@@ -10,3 +10,5 @@ csptest
 csptest-tsan
 fanout
 libcsp.a
+spike/findslot
+spike/spike

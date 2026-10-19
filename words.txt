@@ -8,8 +8,10 @@ The goal: push the complexity into the library. A client source
 file should read as plainly as Go -- easily read process
 definitions, easily read invocations, no block syntax.
 
-Status, 2026-10-18: built. Everything below is implemented; what is
-tested is listed under Verified, at the end.
+Status, 2026-10-18: the thread version is built -- one thread per
+process -- and installed as a library. Everything below is
+implemented, except The scheduler, which is designed and next to
+build. What is tested is listed under Verified, at the end.
 
 
 Files:
@@ -21,6 +23,9 @@ Files:
 	bench/     the COOPER benchmark: Go, ObjCSP and linear ObjC
 	           versions of the same job (cd bench; make) -- see
 	           Performance
+	spike/     the scheduler spike: finding the pool slot, and
+	           coroutines interleaving pools with and without
+	           swapping it (cd spike; make) -- see The scheduler
 
 	The deliverable is a static library, libcsp.a, and its header,
 	CSP.h. Build and install once:
@@ -336,7 +341,9 @@ Left out, on purpose:
 Decisions, 2026-10-18:
 
 	one thread per process -- memory isn't the constraint; the
-	    2,048-thread cap is
+	    2,048-thread cap is. Later overturned by the COOPER
+	    benchmark: the cost that matters is kernel time per
+	    process and per message. See The scheduler.
 	short names: Chan, chan, go, alt -- readability over Cocoa's
 	    prefix convention
 	typed channels, any object type
@@ -353,6 +360,15 @@ Decisions, 2026-10-18:
 	    flat struct. Parcel over Packet: delivery, not networking.
 	    Our own class, not an NSValue subclass (NSValue is a
 	    class cluster); it adds a runtime type check.
+	the deliverable: a static library, libcsp.a + CSP.h, installed
+	    in /usr/local -- see Files
+	the scheduler: coroutines on one worker per core, all cores
+	    from the start, brought up at CSP_MAXPROCS=1 -- see The
+	    scheduler and The hazards
+	settings named after Go: CSP_MAXPROCS (GOMAXPROCS) and
+	    CSP_DEBUG=threads (GODEBUG) -- not CSP_THREADS=1, which
+	    read as switching a feature on rather than the good thing
+	    off
 
 
 Performance, 2026-10-18 -- the COOPER benchmark:
@@ -428,10 +444,11 @@ The scheduler -- design, 2026-10-18 (not built yet):
 	its registers and loads another runnable process's -- a switch
 	in user space, no kernel involved. How Go does it.
 
-	All cores from the start. A single-thread version (libmill's
-	choice, which dodges the hard parts) was considered and
-	dropped: a CSP runtime that doesn't use every core isn't worth
-	having.
+	All cores from the start. A separate single-thread version
+	(libmill's choice, which dodges the hard parts) was considered
+	and dropped: a CSP runtime that doesn't use every core isn't
+	worth having. One worker is still the first setting the real
+	scheduler runs at -- see Building it.
 
 	The parts:
 
@@ -470,7 +487,7 @@ The scheduler -- design, 2026-10-18 (not built yet):
 	The spike -- does Objective-C allow it at all? The go/no-go
 	question was autorelease pools. The runtime keeps a pool stack
 	per thread; coroutines interleave on threads and move between
-	them. Tested outside the library, macOS 12, Intel:
+	them. Tested outside the library, in spike/, macOS 12, Intel:
 
 	    the pool stack is one pointer in one thread-local slot
 	        (slot 43 here); nothing else about pools is per-thread
@@ -614,8 +631,16 @@ Building it -- order:
 
 	1. Isolate the sleep-and-wake step in today's code: no change
 	   in behavior, the semaphore behind one interface.
-	2. Coroutines and workers on all cores, with pool swapping and
-	   slot discovery. main keeps the semaphore path.
+	2. Coroutines and workers, written for all cores from the start
+	   -- locks and all -- with pool swapping and slot discovery.
+	   main keeps the semaphore path. Brought up first at
+	   CSP_MAXPROCS=1: the same code with one worker, so the first
+	   bugs (a bad switch, a lost process) repeat the same way every
+	   run. The full test suite passes at 1 before going to 2, then
+	   all cores; anything that breaks after is a multi-core bug by
+	   elimination. Not a separate single-thread scheduler -- that
+	   would be thrown away. CSP_MAXPROCS=1 stays useful after: a
+	   quick way to ask whether a race is involved.
 	3. Timers, sleepFor, yield.
 	4. The monitor.
 	5. Deadlock detection, the ctrl-\ dump, CSP_DEBUG=threads.

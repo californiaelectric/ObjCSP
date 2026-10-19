@@ -20,13 +20,16 @@ static NSString *lorem(void) {
     return [b substringToIndex:1000];
 }
 
-// Overwrites 5 random spots in a copy of the block with "COOPER".
-static NSString *cooperize(NSString *block) {
+// Process i's spots: different for each, the same as cooper.go's.
+static NSUInteger spot(int i, int k) {
+    return (NSUInteger)(i * 7919 + k * 104729) % (1000 - 6 + 1);
+}
+
+// Overwrites process i's 5 spots in a copy of the block with "COOPER".
+static NSString *cooperize(int i, NSString *block) {
     NSMutableString *s = [block mutableCopy];
-    for (int k = 0; k < 5; k++) {
-        NSUInteger p = arc4random_uniform((uint32_t)(s.length - 6 + 1));
-        [s replaceCharactersInRange:NSMakeRange(p, 6) withString:@"COOPER"];
-    }
+    for (int k = 0; k < 5; k++)
+        [s replaceCharactersInRange:NSMakeRange(spot(i, k), 6) withString:@"COOPER"];
     return s;
 }
 

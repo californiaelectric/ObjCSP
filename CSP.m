@@ -2,19 +2,21 @@
 //
 // The design follows Go's runtime. Each channel has a lock, a buffer, and
 // two queues of waiting processes: receivers and senders. A process that
-// can't proceed puts an entry on a queue and sleeps on its own semaphore.
-// Whoever completes it -- a sender, a receiver, or close -- claims the
-// entry, hands over the value, and signals the semaphore.
+// can't proceed puts an entry on a queue and parks. Whoever completes it
+// -- a sender, a receiver, or close -- claims the entry, hands over the
+// value, and unparks it. Parking is CSPSched.m's business: a coroutine
+// switches out, a plain thread sleeps on a semaphore.
 //
-// alt puts one entry per case on several channels at once, all sharing
+// ALT puts one entry per case on several channels at once, all sharing
 // one waiter. The first channel to claim the waiter wins; the claim is an
 // atomic compare-and-swap, so the losers see it taken and skip it. When
-// alt wakes it takes its remaining entries off every queue.
+// ALT wakes it takes its remaining entries off every queue.
 //
-// alt locks all its channels at once, always in address order, and
+// ALT locks all its channels at once, always in address order, and
 // everything else locks one channel at a time, so locks can't deadlock.
 
 #import "CSP.h"
+#import "CSPSched.h"
 #import <pthread.h>
 #import <stdatomic.h>
 
@@ -23,27 +25,9 @@
 void *objc_autoreleasePoolPush(void);
 void objc_autoreleasePoolPop(void *pool);
 
-// A process waiting on one or more channel operations.
-@interface CSPWaiter : NSObject {
-@public
-    _Atomic long fired;              // -1 until one of its entries is claimed
-    dispatch_semaphore_t sem;
-}
-@end
-
-@implementation CSPWaiter
-- (instancetype)init {
-    if ((self = [super init])) {
-        atomic_init(&fired, -1);
-        sem = dispatch_semaphore_create(0);
-    }
-    return self;
-}
-@end
-
 typedef enum { CSPReceive, CSPSend, CSPAfter, CSPOtherwise } CSPKind;
 
-// One operation: a plain send or receive, or one case of an alt. While
+// One operation: a plain send or receive, or one case of an ALT. While
 // its process waits, the entry sits on its channel's queue.
 @interface CSPEntry : NSObject {
 @public
@@ -77,11 +61,11 @@ static BOOL claim(CSPEntry *e) {
 }
 
 static void wake(CSPEntry *_Nullable e) {
-    if (e) dispatch_semaphore_signal(e->waiter->sem);
+    if (e) CSPUnpark(e->waiter);
 }
 
 // Takes the first entry on q that can still be claimed, dropping the ones
-// whose alt already went another way.
+// whose ALT already went another way.
 static CSPEntry *dequeue(NSMutableArray<CSPEntry *> *q) {
     while (q.count) {
         CSPEntry *e = q[0];
@@ -89,10 +73,6 @@ static CSPEntry *dequeue(NSMutableArray<CSPEntry *> *q) {
         if (claim(e)) return e;
     }
     return nil;
-}
-
-static void sleepForever(void) {
-    dispatch_semaphore_wait(dispatch_semaphore_create(0), DISPATCH_TIME_FOREVER);
 }
 
 
@@ -130,7 +110,7 @@ static void sleepForever(void) {
 }
 
 // The two operations that don't have to wait, shared by send, receive and
-// alt. Called with the lock held; if they complete another process's
+// ALT. Called with the lock held; if they complete another process's
 // entry, it comes back in *woken, to be signalled once the lock is dropped.
 //
 // The out-parameters are __strong on purpose. ARC's default for them is
@@ -182,7 +162,7 @@ static void raiseClosed(NSString *what) {
 
 - (void)send:(id)value {
     if (!value) [NSException raise:NSInvalidArgumentException format:@"send: nil can't be sent"];
-    pthread_mutex_lock(&mu);
+    CSPLock(&mu);
     if (closed) {
         pthread_mutex_unlock(&mu);
         raiseClosed(@"send:");
@@ -193,16 +173,16 @@ static void raiseClosed(NSString *what) {
         wake(woken);
         return;
     }
-    CSPWaiter *w = [CSPWaiter new];
+    CSPWaiter *w = CSPNewWaiter("send");
     CSPEntry *e = entry(w, 0, CSPSend, self, value);
     [sendq addObject:e];
     pthread_mutex_unlock(&mu);
-    dispatch_semaphore_wait(w->sem, DISPATCH_TIME_FOREVER);
+    CSPPark(w);
     if (e->closed) raiseClosed(@"send:");
 }
 
 - (id)receive {
-    pthread_mutex_lock(&mu);
+    CSPLock(&mu);
     id value = nil;
     CSPEntry *woken = nil;
     if (tryReceive(self, &value, &woken)) {
@@ -210,16 +190,16 @@ static void raiseClosed(NSString *what) {
         wake(woken);
         return value;
     }
-    CSPWaiter *w = [CSPWaiter new];
+    CSPWaiter *w = CSPNewWaiter("receive");
     CSPEntry *e = entry(w, 0, CSPReceive, self, nil);
     [recvq addObject:e];
     pthread_mutex_unlock(&mu);
-    dispatch_semaphore_wait(w->sem, DISPATCH_TIME_FOREVER);
+    CSPPark(w);
     return e->value;
 }
 
 - (void)close {
-    pthread_mutex_lock(&mu);
+    CSPLock(&mu);
     if (closed) {
         pthread_mutex_unlock(&mu);
         [NSException raise:NSInternalInconsistencyException format:@"close: channel already closed"];
@@ -270,7 +250,7 @@ static void raiseClosed(NSString *what) {
 
 // For tests: how many entries are queued on c, stale ones included.
 NSUInteger CSPChanQueued(Chan *c) {
-    pthread_mutex_lock(&c->mu);
+    CSPLock(&c->mu);
     NSUInteger n = c->recvq.count + c->sendq.count;
     pthread_mutex_unlock(&c->mu);
     return n;
@@ -281,41 +261,7 @@ Chan *CSPMakeChan(NSUInteger capacity) {
 }
 
 
-// go
-
-static void *runProcess(void *arg) {
-    @autoreleasepool {
-        void (^block)(void) = (__bridge_transfer id)arg;
-        block();
-    }
-    return NULL;
-}
-
-void CSPGo(void (^block)(void)) {
-    // Foundation assumes it is single-threaded until an NSThread has been
-    // started; start one so it locks properly around our raw threads.
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        [NSThread detachNewThreadWithBlock:^{}];
-    });
-
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    void *arg = (__bridge_retained void *)[block copy];
-    pthread_t thread;
-    int err = pthread_create(&thread, &attr, runProcess, arg);
-    pthread_attr_destroy(&attr);
-    if (err) {
-        CFRelease(arg);
-        [NSException raise:NSInternalInconsistencyException
-                    format:@"go: can't start a process: %s (macOS allows 2,048 threads per program)",
-                           strerror(err)];
-    }
-}
-
-
-// alt
+// ALT
 
 @interface CSPAlt : NSObject {
 @public
@@ -367,7 +313,7 @@ long CSPAltIndex(CSPAlt *a) {
 }
 
 static void addCase(CSPAlt *a, long i, CSPKind kind, Chan *c, id value) {
-    NSCAssert(i == (long)a->cases.count, @"alt: cases out of order");
+    NSCAssert(i == (long)a->cases.count, @"ALT: cases out of order");
     [a->cases addObject:entry(nil, i, kind, c, value)];
 }
 
@@ -392,7 +338,7 @@ BOOL CSPAltAddAfter(CSPAlt *a, long i, double seconds) {
 }
 
 BOOL CSPAltAddOtherwise(CSPAlt *a, long i) {
-    if (a->otherwiseIndex >= 0) [NSException raise:NSInvalidArgumentException format:@"alt: two otherwise cases"];
+    if (a->otherwiseIndex >= 0) [NSException raise:NSInvalidArgumentException format:@"ALT: two OTHERWISE cases"];
     addCase(a, i, CSPOtherwise, nil, nil);
     a->otherwiseIndex = i;
     return NO;
@@ -412,6 +358,19 @@ id CSPAltValue(CSPAlt *a) {
 
 @implementation CSPAlt
 
+// For ALT's shuffle: xorshift64*, one per thread, seeded once from
+// arc4random -- which is cryptographic, and behind one lock for the whole
+// program, so busy workers queued on it. No channel operation happens
+// between the uses here, so a process can't move threads in the middle.
+static uint64_t cheapRandom(void) {
+    static _Thread_local uint64_t x;
+    if (!x) x = ((uint64_t)arc4random() << 32 | arc4random()) | 1;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    return x * 0x2545F4914F6CDD1DULL;
+}
+
 // The channels in the cases, each once, in address order.
 - (NSArray<Chan *> *)lockOrder {
     NSMutableArray<Chan *> *chans = [NSMutableArray new];
@@ -426,7 +385,7 @@ id CSPAltValue(CSPAlt *a) {
 }
 
 static void lockAll(NSArray<Chan *> *chans) {
-    for (Chan *c in chans) pthread_mutex_lock(&c->mu);
+    for (Chan *c in chans) CSPLock(&c->mu);
 }
 
 static void unlockAll(NSArray<Chan *> *chans) {
@@ -444,7 +403,7 @@ static void unlockAll(NSArray<Chan *> *chans) {
     for (CSPEntry *e in cases)
         if (e->chan) [order addObject:e];
     for (NSUInteger k = order.count; k > 1; k--)
-        [order exchangeObjectAtIndex:k - 1 withObjectAtIndex:arc4random_uniform((uint32_t)k)];
+        [order exchangeObjectAtIndex:k - 1 withObjectAtIndex:cheapRandom() % k];
 
     lockAll(chans);
 
@@ -476,31 +435,20 @@ static void unlockAll(NSArray<Chan *> *chans) {
         return;
     }
 
-    if (order.count == 0 && afterIndex < 0) {     // alt {} waits forever, as in Go
-        unlockAll(chans);
-        sleepForever();
-    }
-
-    // Nothing ready: queue on every channel, and wait.
-    CSPWaiter *w = [CSPWaiter new];
+    // Nothing ready: queue on every channel, and wait. With no channels and
+    // no after -- ALT {} -- nothing ever claims the waiter: it waits
+    // forever, as in Go.
+    CSPWaiter *w = CSPNewWaiter("ALT");
     for (CSPEntry *e in order) {
         e->waiter = w;
         [e->kind == CSPReceive ? e->chan->recvq : e->chan->sendq addObject:e];
     }
     unlockAll(chans);
 
-    if (afterIndex >= 0) {
-        dispatch_time_t t = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(MAX(afterSeconds, 0) * NSEC_PER_SEC));
-        if (dispatch_semaphore_wait(w->sem, t) != 0) {
-            // Timed out -- unless a channel claimed us in the meantime, in
-            // which case its signal is on the way.
-            long none = -1;
-            if (!atomic_compare_exchange_strong(&w->fired, &none, afterIndex))
-                dispatch_semaphore_wait(w->sem, DISPATCH_TIME_FOREVER);
-        }
-    } else {
-        dispatch_semaphore_wait(w->sem, DISPATCH_TIME_FOREVER);
-    }
+    if (afterIndex >= 0)
+        CSPParkFor(w, afterIndex, afterSeconds);
+    else
+        CSPPark(w);
     chosen = atomic_load(&w->fired);
 
     // Off every queue, so a case that never fires doesn't pile up entries.

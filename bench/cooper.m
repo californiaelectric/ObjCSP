@@ -8,19 +8,26 @@
 
 enum { N = 1000 };
 
-void cooper(Chan<NSString *> *in, Chan<NSString *> *out) {
-    [out send:cooperize([in receive])];
+// CSP	a process body; in and out are channels of strings (Go: in, out chan string)
+void cooper(int i, Chan<NSString *> *in, Chan<NSString *> *out) {
+    // CSP	wait for a block on in (Go: <-in), mark it, send it on out (Go: out <- ...)
+    [out send:cooperize(i, [in receive])];
 }
 
 static double trial(NSString *block, FILE *null) {
     double t0 = micros();
+    // CSP	make an unbuffered channel of strings, like Go's make(chan string)
     Chan<NSString *> *in = chan();
+    // CSP	another unbuffered channel, for the marked blocks coming back
     Chan<NSString *> *out = chan();
     for (int i = 0; i < N; i++)
-        go(cooper(in, out));
+        // CSP	start process i (Go: go cooper(i, in, out)); it waits for the block on in
+        go(cooper(i, in, out));
     for (int i = 0; i < N; i++)
+        // CSP	hand the block to one waiting process; waits until one takes it
         [in send:block];
     for (int i = 0; i < N; i++)
+        // CSP	wait for the next marked block from any process (Go: <-out)
         dump(null, [out receive]);
     fflush(null);
     return micros() - t0;

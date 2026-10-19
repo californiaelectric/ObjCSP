@@ -1,8 +1,10 @@
 // cooper.go -- the Go version of the COOPER benchmark.
 //
 // 1,000 goroutines each take the lorem block from a channel, overwrite 5
-// random spots with "COOPER", and send the result back. main collects all
-// 1,000 and writes them to /dev/null.
+// spots with "COOPER", and send the result back. main collects all 1,000
+// and writes them to /dev/null. Goroutine i's spots are
+// (i*7919 + k*104729) mod 995 for k = 0..4 -- different for each, the same
+// in every version, and no shared random-number generator to fight over.
 //
 //	go build -o cooper-go cooper.go && ./cooper-go [trials [outfile]]
 package main
@@ -10,7 +12,6 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"math/rand"
 	"os"
 	"strconv"
 	"strings"
@@ -38,11 +39,14 @@ func lorem() string {
 	return b.String()[:1000]
 }
 
-func cooper(in chan string, out chan string) {
+func spot(i, k int) int {
+	return (i*7919 + k*104729) % (1000 - 6 + 1)
+}
+
+func cooper(i int, in chan string, out chan string) {
 	s := []byte(<-in)
 	for k := 0; k < 5; k++ {
-		p := rand.Intn(len(s) - 6 + 1)
-		copy(s[p:], "COOPER")
+		copy(s[spot(i, k):], "COOPER")
 	}
 	out <- string(s)
 }
@@ -52,7 +56,7 @@ func trial(block string, null *bufio.Writer) time.Duration {
 	in := make(chan string)
 	out := make(chan string)
 	for i := 0; i < n; i++ {
-		go cooper(in, out)
+		go cooper(i, in, out)
 	}
 	for i := 0; i < n; i++ {
 		in <- block

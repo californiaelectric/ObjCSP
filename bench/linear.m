@@ -10,7 +10,7 @@ enum { N = 1000 };
 static double trial(NSString *block, FILE *null) {
     double t0 = micros();
     for (int i = 0; i < N; i++)
-        dump(null, cooperize(block));
+        dump(null, cooperize(i, block));
     fflush(null);
     return micros() - t0;
 }

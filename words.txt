@@ -8,27 +8,36 @@ The goal: push the complexity into the library. A client source
 file should read as plainly as Go -- easily read process
 definitions, easily read invocations, no block syntax.
 
-Status, 2026-10-18: the thread version is built -- one thread per
-process -- and installed as a library. Everything below is
-implemented, except The scheduler, which is designed and next to
-build. What is tested is listed under Verified, at the end.
+Status, 2026-10-18: built, with the scheduler -- processes are
+coroutines run by one worker thread per core. The first version,
+one thread per process, remains as CSP_DEBUG=threads. Intel Macs
+only for the scheduler so far; other CPUs run a thread per
+process. Installed as a library. What is tested is listed under
+Verified, at the end.
 
 
 Files:
 
-	CSP.h      the library: everything a client file uses
-	CSP.m      the implementation
-	test.m     the tests (make check; make tsan for the race checker)
-	fanout.m   a distributed worker written as a client (make fanout)
-	bench/     the COOPER benchmark: Go, ObjCSP and linear ObjC
-	           versions of the same job (cd bench; make) -- see
-	           Performance
-	spike/     the scheduler spike: finding the pool slot, and
-	           coroutines interleaving pools with and without
-	           swapping it (cd spike; make) -- see The scheduler
+	CSP.h          the library: everything a client file uses
+	CSP.m          channels, ALT, Parcel
+	CSPSched.h     internal: how a waiting process sleeps and wakes
+	CSPSched.m     the scheduler, and the thread-per-process fallback
+	csp_x86_64.S   the context switch, for Intel
+	test.m         the tests: make check builds and runs csptest;
+	               make tsan, the same under the race checker
+	fanout.m       a distributed worker written as a client
+	               (make fanout)
+	bench/         three benchmarks, each in Go and ObjCSP, with
+	               and without concurrency (cd bench; make data;
+	               make) -- see Performance
+	examples/      verify.m: re-verify a SQLite database of people,
+	               one process per person and one writer process
+	               (cd examples; make; ./verify create; ./verify csp)
 
 	The deliverable is a static library, libcsp.a, and its header,
-	CSP.h. Build and install once:
+	CSP.h. The library is universal -- one file for Intel and Apple
+	Silicon Macs; on Apple Silicon it runs a thread per process
+	until the scheduler is ported there. Build and install once:
 
 	    make
 	    sudo make install       # libcsp.a to /usr/local/lib,
@@ -40,8 +49,8 @@ Files:
 
 	clang and the linker search /usr/local/include and
 	/usr/local/lib on their own, so a client needs no path flags.
-	It imports CSP.h -- after any other headers, because alt and
-	otherwise are macros and would rewrite those words in anything
+	It imports CSP.h -- after any other headers, because ALT and
+	OTHERWISE are macros and would rewrite those words in anything
 	imported later -- and links the library:
 
 	    #import "CSP.h"
@@ -75,6 +84,18 @@ Processes:
 	go(work([c receive])), runs in the new process, not before it
 	starts. Do the call first, into a variable, and pass that.
 
+	A message to an object works the same way -- any object, any
+	method, from anywhere, self included:
+
+	    go([downloader fetch:url into:results]);
+	    go([self scoreDocument:doc]);
+
+	The receiver and arguments are kept alive until the process
+	finishes. The return value is dropped, as in Go -- pass a
+	channel to get a result back. The object is shared, not
+	copied: if the caller and the process both change it at once,
+	that's a race, as in Go.
+
 	go({ ... }) runs a block of statements as a process -- Go's
 	go func() { ... }():
 
@@ -83,11 +104,24 @@ Processes:
 	        [jobs close];
 	    });
 
-	Each process is its own thread, and the threads spread across
-	all cores. A blocked process -- waiting on a channel -- uses no
-	CPU and roughly 20-40 KB of memory (estimate, not measured).
-	macOS allows 2,048 threads per program, so plan on at most
-	about 2,000 live processes at once.
+	go() can't capture a C array: go(f(fds[0])) with int fds[2]
+	won't compile. Copy what's needed into plain variables first --
+	int readEnd = fds[0] -- and pass those. (Go copies arrays; a
+	block can't.)
+
+	Processes run on the scheduler: coroutines, run by one worker
+	thread per core, so they spread across all cores. A process
+	waiting on a channel uses no CPU and no thread -- just its
+	stack, of which only the pages it touched use memory. 20,000
+	live at once start in about 0.12 s. (With CSP_DEBUG=threads each
+	process is a thread again, and macOS's 2,048-thread limit
+	applies.)
+
+	    sleepFor(seconds)    pause this process; the others go on
+	    yield()              let others run, for a long computation
+
+	Use sleepFor, not sleep() or [NSThread sleepForTimeInterval:]:
+	those hold up a whole worker -- see The hazards, 2.
 
 	When main returns, the program ends, and any processes still
 	running end with it. Same as Go.
@@ -208,13 +242,13 @@ Close and range:
 	equivalent of Go's chan struct{}. Rarely needed.
 
 
-alt -- Go's select:
+ALT -- Go's select:
 
-	alt waits on several channel operations at once and runs
+	ALT waits on several channel operations at once and runs
 	whichever is ready first. If several are ready together, it
 	picks one at random.
 
-	    alt {
+	    ALT {
 	        receive(r, results) { use(r); }
 	        receive(q, quit)    { stop = YES; }
 	        after(2.0)          { NSLog(@"story timed out"); }
@@ -232,15 +266,15 @@ alt -- Go's select:
 
 	after(secs) { }     nothing else was ready within secs seconds.
 
-	otherwise { }       nothing is ready right now. With this case
-	                    alt never waits.
+	OTHERWISE { }       nothing is ready right now. With this case
+	                    ALT never waits.
 
 	A body is ordinary code. return returns from the enclosing
 	function. break ends the case only, not a surrounding loop --
 	the same trap as Go; use a flag to leave a loop.
 
-	Every case must be written directly inside the alt -- not
-	inside an if. (alt runs its body twice, first to learn the
+	Every case must be written directly inside the ALT -- not
+	inside an if. (ALT runs its body twice, first to learn the
 	cases, then to run the chosen one; a case that appears on only
 	one pass confuses it.) A case's channel and value are evaluated
 	once.
@@ -248,25 +282,30 @@ alt -- Go's select:
 	A case on a nil channel is never ready, as in Go: setting a
 	channel variable to nil switches its case off.
 
-	alt {} with no cases waits forever, as Go's select {} does.
+	ALT {} with no cases waits forever, as Go's select {} does.
 
-	Named alt, occam's word, because select is already a POSIX
-	function.
+	Named ALT, occam's word, because select is already a POSIX
+	function -- and in capitals, as occam wrote it and as C writes
+	macros. ALT and OTHERWISE are the two macros that rewrite their
+	word wherever it appears; capitals make a clash with ordinary
+	code much less likely (lowercase alt is a struct field in
+	Apple's <printf.h>). The case words -- receive, sending, after
+	-- only expand when followed by (, so they stay lowercase.
 
 
-The four alt patterns:
+The four ALT patterns:
 
 	1. Anything waiting? (e.g. a ctrl-c check between rounds)
 
-	    alt {
+	    ALT {
 	        receive(s, sigc) { save(); return; }
-	        otherwise        { }
+	        OTHERWISE        { }
 	    }
 
 	2. Work or stop.
 
 	    for (;;) {
-	        alt {
+	        ALT {
 	            receive(j, jobs) { train(j.intValue); }
 	            receive(d, done) { return; }
 	        }
@@ -274,16 +313,16 @@ The four alt patterns:
 
 	3. Timeout.
 
-	    alt {
+	    ALT {
 	        receive(line, c) { use(line); }
 	        after(2.0)       { NSLog(@"story timed out"); }
 	    }
 
-	4. Deliver or stop. Without alt, [out send:s] would wait
+	4. Deliver or stop. Without ALT, [out send:s] would wait
 	   forever if nobody takes s, and never hear quit.
 
 	    for (Story *s in stories) {
-	        alt {
+	        ALT {
 	            sending(out, s)  { }
 	            receive(q, quit) { return; }
 	        }
@@ -328,10 +367,10 @@ Left out, on purpose:
 	Go's v, ok := <-c. Not needed: nil can't be sent, so nil means
 	closed.
 
-	A scheduler multiplexing processes over a few threads, the way
-	Go does. Left out at first as only worth it past ~2,000 live
-	processes -- but see Performance: it is also what small
-	processes need. Now designed -- see The scheduler.
+	(A scheduler was left out at first, as only worth it past
+	~2,000 live processes. The COOPER benchmark showed it is also
+	what small processes need, and it is now built -- see The
+	scheduler.)
 
 	Channels of plain C values (Chan of int). Box ints as @(j);
 	make structs into small classes, or carry existing C structs
@@ -344,11 +383,11 @@ Decisions, 2026-10-18:
 	    2,048-thread cap is. Later overturned by the COOPER
 	    benchmark: the cost that matters is kernel time per
 	    process and per message. See The scheduler.
-	short names: Chan, chan, go, alt -- readability over Cocoa's
+	short names: Chan, chan, go, ALT -- readability over Cocoa's
 	    prefix convention
 	typed channels, any object type
 	nil can't be sent; nil from receive means closed
-	full select, as alt, written with macros rather than blocks --
+	full select, as ALT, written with macros rather than blocks --
 	    blocks needed ^(Type *x){ }, __block flags, and couldn't
 	    return from the function
 	timeouts (after) in the first version
@@ -365,74 +404,173 @@ Decisions, 2026-10-18:
 	the scheduler: coroutines on one worker per core, all cores
 	    from the start, brought up at CSP_MAXPROCS=1 -- see The
 	    scheduler and The hazards
+	ALT and OTHERWISE in capitals, the rest lowercase -- see ALT.
+	    go stays go: it reads as Go does, libmill and libdill use
+	    it, and it only expands before (. Not par: occam's PAR
+	    waits for all its parts to finish, go doesn't wait. (A
+	    real PAR block that waits for all is a possible later
+	    addition.) Not spawn: an ugly word.
 	settings named after Go: CSP_MAXPROCS (GOMAXPROCS) and
 	    CSP_DEBUG=threads (GODEBUG) -- not CSP_THREADS=1, which
 	    read as switching a feature on rather than the good thing
 	    off
 
 
-Performance, 2026-10-18 -- the COOPER benchmark:
+Performance, 2026-10-18:
 
-	The job: a 1,000-character lowercase lorem ipsum block. 1,000
-	processes each take it from a channel, overwrite 5 random
-	spots with "COOPER", and send it back on a second channel;
-	main collects all 1,000 and writes them to /dev/null. The
-	same job three ways, in bench/:
+	Three benchmarks in bench/, each written four ways -- Go with
+	goroutines, Go in a straight line, ObjCSP, and ObjC in a straight
+	line -- plus ObjCSP with CSP_DEBUG=threads. Every version's
+	output is checked against Go's, byte for byte, before timing.
+	This Mac: 8 cores (likely 4 physical), Intel, macOS 12; Go 1.19.
 
-	    cooper.go    Go, goroutines
-	    cooper.m     ObjCSP, line for line with the Go
-	    linear.m     ObjC, 1,000 plain calls on main
+	COOPER -- tiny work. A 1,000-character lowercase lorem ipsum
+	block; 1,000 processes each take it from a channel, write
+	"COOPER" over 5 spots, and send it back; main collects them all
+	and writes them to /dev/null. Process i's spots are
+	(i*7919 + k*104729) mod 995, k = 0..4. (They were random at
+	first, but macOS's arc4random is behind one lock for the whole
+	program, and 8 workers queued on it -- the benchmark was
+	measuring the random-number generator.) Warm, median of
+	5 runs x 21 trials:
 
-	All three checked first: 1,000 distinct blocks of exactly
-	1,000 characters. (Some show 3 or 4 COOPERs, not 5: a random
-	spot can land on an earlier one.)
+	    Go, goroutines       1.9 ms
+	    Go, linear           0.6 ms
+	    ObjCSP               5.5 ms
+	    ObjCSP, threads     23.7 ms
+	    ObjC, linear         3.6 ms
 
-	One trial, median ms (5 runs x 21 trials, this Mac: 8 cores,
-	Intel, macOS 12; Go 1.19):
+	Everyone loses to a straight line here, Go by more (3x) than
+	ObjCSP (1.5x): the work per block is smaller than a handoff.
+	What COOPER measures is the cost per process -- start it, give
+	it the block, take the result: about 2 us for ObjCSP, 1.25 us
+	for Go. With a thread per process it was about 20 us.
 
-	                     cold    warm    whole program, 21 trials
-	    Go               2.9     2.2      51 ms
-	    ObjCSP          23.6    21.6     592 ms
-	    ObjC linear      5.5     4.4     107 ms
+	Models -- real computation. 1,000 independent linear
+	classifiers over one generated dataset, 400 samples x 256
+	features; one process per model trains it for 10 passes, about
+	a million multiply-adds, a few ms. Median of 5 runs x 3 trials:
 
-	ObjCSP is about 10x slower than Go and 5x slower than doing
-	the work in a straight line. Where its 21 ms goes, warm:
+	    Go, goroutines       193 ms
+	    Go, linear          1172 ms
+	    ObjCSP               180 ms
+	    ObjCSP, threads      206 ms
+	    ObjC, linear        1066 ms
 
-	    spawn     ~9.5 ms   creating 1,000 kernel threads, ~9.5 us each
-	    send      ~2.7 ms   each handoff wakes a sleeping thread
-	    collect   ~9.5 ms   each take wakes the sender's thread so it
-	                        can finish and exit
+	ObjCSP 5.9x over its straight line, Go 6.1x -- about all this
+	Mac has -- and ObjCSP slightly faster than Go: the same
+	arithmetic, and the cost per process vanishes next to
+	milliseconds of work.
 
-	Each block is about 4 us of work. ObjCSP spends about 20 us of
-	kernel time per process around it: creating a thread, and
-	waking one for every message. Go does both in user space.
-	Spare cores can't win that back when the work is this small.
+	Documents -- nested fan-out with files and strings. 2,000
+	generated documents of made-up words, 2-20 KB each (make data),
+	and 9 categories of 40 words. One process per document reads
+	its file and splits it into words, then starts one process per
+	category to count the document's words in it; the document goes
+	to the category with the most. Up to 20,000 processes at once.
+	Median of 5 runs x 3 trials:
 
-	Threads are fine when each process does real work -- scoring
-	a story takes far longer than starting a thread. They are
-	expensive for many tiny processes, which is exactly the "let
-	'em rip" style: start one per piece of work, never a pool.
+	    Go, goroutines       374 ms
+	    Go, linear          1377 ms
+	    ObjCSP              1032 ms
+	    ObjCSP, threads     can't run -- past the 2,048-thread limit
+	    ObjC, linear        2593 ms
 
-	The two fixes considered (chosen: the scheduler):
+	ObjCSP 2.5x over its straight line, Go 3.7x in that run. About
+	1.9x of the gap to Go is Foundation itself -- the straight lines
+	show it: NSString splitting and NSSet lookups against Go's
+	strings and maps.
 
-	thread reuse     a finished process's thread parks, and the
-	                 next go() takes it. Small and safe. But it
-	                 can't help here: all 1,000 processes are alive
-	                 at once, so 1,000 threads must exist. It helps
-	                 programs that start processes over time.
+	The rest -- weaker scaling -- was looked into, 2026-10-18:
 
-	a scheduler      processes become coroutines with small stacks,
-	                 run by ~8 threads, one per core; a blocked
-	                 process switches to another in user space.
-	                 How Go does it, and the real fix -- client
-	                 code unchanged. The cost: hand-written context
-	                 switching, and a process blocking outside our
-	                 channels (a file read, sleep, a lock) stalls
-	                 one of the 8 threads. Timers move into the
-	                 scheduler.
+	    measured again, Go and ObjCSP alternating round by round so
+	        both see the same conditions: Go 2.98x, ObjCSP 2.47x.
+	        Go's 3.7x was a good moment on this machine, which
+	        slows its clock when every core is busy (about 10 W).
+	        The real gap in scaling is about 20%.
+	    the nano allocator (MallocNanoZone): no effect -- 2.39-2.45x
+	        unset, on or off. (This session's shell had
+	        MallocNanoZone=0 set; every earlier run inherited it.)
+	    reference counting on shared objects: barely in the sample.
+	    stacks: with up to 20,000 processes alive, all but 1,024
+	        finished stacks were unmapped and later mapped again.
+	        Unmapping interrupts every other core running the
+	        program, and showed in the sample (munmap, mmap,
+	        mprotect). Stacks now stay mapped -- see Known limits --
+	        but offering their pages back costs about the same; only
+	        keeping every one exactly as it is gained anything (~6%),
+	        at the price of holding ~150 MB for good. Not taken.
+	    what's left is Foundation's own work: containsObject:,
+	        string hashing, objc_msgSend, splitting -- the job
+	        itself, scaling a little less well than Go's simpler
+	        strings and maps on this machine. Not something the
+	        scheduler can fix. A Mac with more cores and power
+	        would say more.
+
+	Waiting against computing -- CSP_MAXPROCS. examples/verify.m
+	re-verifies 1,000 people in a SQLite database: each check is a
+	format test plus a 1-20 ms wait standing in for a mail server,
+	and one writer process stamps the verified ones in batches.
+
+	    verify, csp        0.03 s   (921 stamped, 79 bad addresses)
+	    verify, linear    12.4  s   (the same 921 and 79)
+	    verify, sql        0.003 s  (one UPDATE, no checks -- the
+	                                 right tool when there's no work
+	                                 per record)
+
+	                     verify (waiting)    models (computing)
+	    CSP_MAXPROCS=1       0.030 s            1102 ms
+	    CSP_MAXPROCS=2       0.028 s             550 ms   2.0x
+	    CSP_MAXPROCS=4       0.028 s             278 ms   4.0x
+	    CSP_MAXPROCS=8       0.030 s             167 ms   6.6x
+
+	Waiting gains nothing from cores: a process in sleepFor holds
+	no worker, so one worker keeps all 1,000 waits going. Computing
+	gains from every core, until the hardware runs out. This Mac's
+	i5-1030NG7 has 4 cores with 2 hardware threads each; macOS fills
+	the 4 cores first, and the second threads helped models a lot
+	(1.66x from 4 to 8) only because its dot product is one chain of
+	dependent additions that leaves gaps for a sibling thread. It
+	also runs on about 10 W, so with every core busy it slows its
+	clock.
+
+	Where processes start to pay -- the crossover. examples/
+	objects.m makes 10,000 objects; each sets a value and calls a
+	method that computes from it, a chain of xorshift steps that
+	can't be skipped. Every version's checksum is the same.
+
+	    work per object        processes   loop      processes vs loop
+	    none                   0.032 s     0.002 s   loop 20-80x faster
+	    1,000 steps,  ~3 us    0.028 s     0.030 s   about even
+	    10,000 steps, ~28 us   0.063 s     0.289 s   processes 4.6x
+	    100,000 steps, ~280 us 0.452 s     2.882 s   processes 6.4x
+
+	(Times are for main making the objects and each process setting
+	and computing one; processes making their own objects came out
+	the same above 1,000 steps.) On this Mac: give a piece of work
+	its own process once it takes more than a few microseconds --
+	parsing a file, an image, a query, a network call. Setting a
+	property or adding two numbers belongs in a loop. Go's
+	crossover is similar, a little lower.
+
+	How COOPER got from 21.6 ms (threads) to 5.5 ms (scheduler), each
+	step found by sampling the running program (macOS's sample):
+
+	    the scheduler itself                     24.6 -> 13.7 ms
+	    a worker that runs out of work looks
+	        again for 50 us before sleeping, and
+	        only wakes a sleeping one if none is
+	        looking; main does the same before
+	        sleeping on its semaphore             13.7 -> ~11 ms
+	    the library's locks try for a moment
+	        before sleeping: they are held for
+	        well under a microsecond, but a busy
+	        pthread mutex sleeps in the kernel
+	        at once                               ~11 -> 6.3 ms
+	    the benchmark's random spots made fixed   6.3 -> 5.5 ms
 
 
-The scheduler -- design, 2026-10-18 (not built yet):
+The scheduler, 2026-10-18 -- built:
 
 	Goal: let 'em rip at Go's cost. One process per piece of work,
 	thousands at once, using every core -- with client code exactly
@@ -475,7 +613,7 @@ The scheduler -- design, 2026-10-18 (not built yet):
 	                 signals; under the scheduler "sleep" becomes
 	                 "switch to another process" and "signal"
 	                 becomes "put it back on the run queue". Waiters,
-	                 claims, alt and close stay as they are.
+	                 claims, ALT and close stay as they are.
 
 	timers           after and sleepFor deadlines in one sorted
 	                 list; an idle worker sleeps until the earliest.
@@ -484,13 +622,14 @@ The scheduler -- design, 2026-10-18 (not built yet):
 	                 thread) blocks on a channel it uses today's
 	                 semaphore path. Both paths coexist.
 
-	The spike -- does Objective-C allow it at all? The go/no-go
+	The experiment -- does Objective-C allow it at all? The go/no-go
 	question was autorelease pools. The runtime keeps a pool stack
 	per thread; coroutines interleave on threads and move between
-	them. Tested outside the library, in spike/, macOS 12, Intel:
+	them. Tested outside the library (a throwaway experiment, not
+	kept in the repo), macOS 12, Intel:
 
 	    the pool stack is one pointer in one thread-local slot
-	        (slot 43 here); nothing else about pools is per-thread
+	        (slot 43 here)
 	    without swapping it per coroutine, two coroutines
 	        interleaving pools on one thread abort the runtime:
 	        "autorelease pool page corrupted"
@@ -510,6 +649,22 @@ The scheduler -- design, 2026-10-18 (not built yet):
 	empty stack, swap back, check the original pool still frees its
 	object. Any failure: fall back to a thread per process, with a
 	one-line warning.
+
+	What the experiment missed. Each pool page also records the
+	thread that made it, and the runtime checks that when it frees
+	the page -- "autorelease pool page corrupted ... pthread X
+	should be Y" -- so a process that made a page on one worker and
+	freed it on another aborted the program. The experiment passed
+	by coincidence: each of its threads exited before the next
+	started, and macOS reused the same thread record. Found when
+	building the scheduler, reproduced every run by a test that
+	frees pages on a different worker. The fix: the startup probe
+	also finds where a page keeps its thread and its links to the
+	pages before and after it (fill a page until a second starts;
+	each field must match exactly once), and when a process
+	continues on a different thread than last time, its pages --
+	usually one or two -- are handed to that thread. Staying on the
+	same worker costs nothing.
 
 
 The hazards, and what was decided:
@@ -587,9 +742,13 @@ The hazards, and what was decided:
 
 Settings:
 
-	CSP_MAXPROCS=n       how many cores to use (default: all)
-	CSP_DEBUG=threads    a thread per process, as now -- for
-	                     debugging, not for running
+	CSP_MAXPROCS=n       how many cores to use (default: all).
+	                     1 is a quick way to ask whether a race
+	                     is involved.
+	CSP_DEBUG=threads    a thread per process, the first version
+	                     -- for debugging, not for running
+	CSP_DEBUG=sched      adds the scheduler's counters to the
+	                     deadlock report
 
 
 Energy:
@@ -599,35 +758,34 @@ Energy:
 	with nothing to do, every thread sleeps in the kernel. No
 	spinning, no polling.
 
-	idle workers     wait in the kernel. A short spin before
-	                 sleeping (Go's trick, for latency) only while
-	                 other workers are busy -- never when the whole
-	                 program is idle.
+	idle workers     wait in the kernel. A worker that just ran out
+	                 of work looks again for 50 us first (Go's
+	                 trick); at most half the workers do at once,
+	                 and then they sleep.
 	the monitor      only watches while some worker is running a
 	                 process; when every process waits on a channel
 	                 it sleeps too.
-	timers           one kernel wait, until the earliest deadline.
-	                 A little slack allowed (~1 ms) so macOS can
-	                 coalesce: 100 processes sleeping "about 1 s"
-	                 wake the CPU once, not 100 times.
+	timers           one kernel wait, until the earliest deadline,
+	                 however many processes are sleeping. (Planned
+	                 but not done: allowing macOS a little slack to
+	                 coalesce nearby deadlines.)
 	deadlock check   run when the last worker goes idle -- an event,
 	                 not a timer.
 
-	The scheduler should cost less energy than threads: most
-	kernel wakeups -- one per message today -- become user-space
-	switches, and finishing sooner on all cores, then idling, is
-	the efficient pattern on modern CPUs.
+	Measured: with 100 processes all waiting on channels, the
+	program had 1 wake-up in a second (test.m). Most kernel wakeups
+	-- one per message with threads -- are user-space switches now,
+	and finishing sooner on all cores, then idling, is the efficient
+	pattern on modern CPUs.
 
 	Later, on Apple Silicon: workers inherit the main thread's
 	quality of service, which decides fast cores or efficient
 	ones. A batch job could run on the efficient cores for much
 	less power -- a setting worth adding then.
 
-	To test: a program whose processes all wait on channels shows
-	0 idle wake-ups (top, or Activity Monitor's Energy tab).
 
 
-Building it -- order:
+Building it -- order, all done 2026-10-18:
 
 	1. Isolate the sleep-and-wake step in today's code: no change
 	   in behavior, the semaphore behind one interface.
@@ -647,8 +805,20 @@ Building it -- order:
 	6. The COOPER benchmark again, against Go; the idle-wakeups
 	   test; the full test suite in both modes.
 
-	Apple Silicon after that: its own switch, slot access and stack
-	setup -- a few dozen lines; everything else shared.
+	What building it found, besides the pool pages (see above):
+
+	the monitor's stand-in retired at once: the stuck worker still
+	    counted as awake, so there seemed to be one worker too many.
+	    Stuck workers are counted apart now.
+	the ALT macro rewrote a variable named ALT inside the library
+	    itself -- the hazard Files warns clients about.
+	the deadlock detector's first catch was in its own test suite:
+	    MIN(x, [c receive]) received twice, because a system header
+	    defines MIN to evaluate its arguments twice. Never put a
+	    channel operation inside a macro argument.
+
+	Apple Silicon next: its own switch, slot access and stack setup
+	-- a few dozen lines; everything else shared.
 
 
 Memory, 2026-10-18:
@@ -664,8 +834,8 @@ Memory, 2026-10-18:
 	What ARC can't collect:
 
 	a process blocked forever -- waiting on a channel nobody will
-	    use again -- keeps its thread, stack and everything it
-	    references until the program exits. Go's goroutine leak;
+	    use again -- keeps its stack and everything it references
+	    until the program exits. Go's goroutine leak;
 	    a program bug, but nothing collects it.
 
 	autoreleased objects in a long-running loop that isn't for-in
@@ -684,6 +854,16 @@ Memory, 2026-10-18:
 
 Known limits:
 
+	Deadlock detection counts main and the processes, not threads a
+	program starts itself outside go(). One of those that would
+	have sent to main later could see main reported as deadlocked.
+
+	A finished process's stack is kept for reuse, never unmapped
+	while the program runs (up to 65,536 of them): the first 1,024
+	exactly as they are, the rest with their pages offered back to
+	the kernel, as malloc does. CSP_HOT_STACKS, set when building
+	the library, changes the 1,024.
+
 	The compiler checks receive and send:, but not the value in a
 	sending(c, v) case; a wrong type there is caught nowhere.
 
@@ -692,8 +872,9 @@ Known limits:
 	Sample { ... } Sample) and the check can tell them apart.
 
 
-Verified, 2026-10-18 (test.m, 50 checks; clean under
-ThreadSanitizer; 100 runs clean):
+Verified, 2026-10-18 (test.m, 72 checks, on the scheduler at 1 and 8
+workers and with CSP_DEBUG=threads (58 apply there); clean under
+ThreadSanitizer):
 
 	unbuffered send waits for the receiver
 	buffered channels: FIFO order, capacity
@@ -703,8 +884,8 @@ ThreadSanitizer; 100 runs clean):
 	for-in as a work queue: 4 workers, 1,000 values, each once
 	for-in drains a pool every pass, and break frees the last
 	    value once the enclosing pool drains
-	alt: random choice among ready cases (about 50/50 over 1,000);
-	    otherwise only when nothing is ready; a nil channel's case
+	ALT: random choice among ready cases (about 50/50 over 1,000);
+	    OTHERWISE only when nothing is ready; a nil channel's case
 	    never fires; after's timing
 	    (0.200-0.205 s for 0.2); sending; deliver-or-stop; receive
 	    on a closed channel fires with nil; return from a case
@@ -712,11 +893,23 @@ ThreadSanitizer; 100 runs clean):
 	a case that never fires leaves nothing queued, over 5,000 alts
 	Parcel: round trip, the copy, wrong-type and closed-channel
 	    errors; anonymous structs alike, tagged ones told apart
-	1,900 processes live at once: started in about 0.02 s
+	pools spanning pages, opened and closed on different workers
+	1,900 processes live at once; 20,000 on the scheduler
 	stress: 6 senders, 5 receivers, 3 unbuffered channels, all
-	    through alt -- 18,000 values, each received exactly once;
+	    through ALT -- 18,000 values, each received exactly once;
 	    6 processes offering both sending and receive on one
 	    channel -- sends and receives balance
+	sleepFor: 200 processes sleeping 0.2 s each take 0.2 s in all
+	yield: with one worker, a computing process lets another run
+	the monitor: with one worker, a process blocked in read() on a
+	    pipe doesn't stop the process that writes to it
+	after inside processes: 100 timeouts at once
+	idle: 100 processes all waiting -- 1 wake-up in a second
+	ending the program, each in a copy of csptest: the deadlock
+	    report (exit 2, with what main and each process waits on
+	    and where it started); the stack overflow message; a
+	    channel operation inside @catch stopped; ctrl-\ dumps every
+	    process (exit 2)
 
 	The first stress runs failed about one in three: each process
 	reported two numbers as two sends on a shared channel, and

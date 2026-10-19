@@ -8,14 +8,14 @@
 //     Score *s = [c receive];             s := <-c
 //     [c close];  for (Score *s in c)     close(c); for s := range c
 //
-//     alt {                               select {
+//     ALT {                               select {
 //         receive(s, c)   { ... }         case s := <-c:
 //         sending(out, v) { ... }         case out <- v:
 //         after(2.0)      { ... }         case <-time.After(2 * time.Second):
-//         otherwise       { ... }         default:
+//         OTHERWISE       { ... }         default:
 //     }                                   }
 //
-// Import this header after any other headers: alt and otherwise are
+// Import this header after any other headers: ALT and OTHERWISE are
 // macros, and would rewrite those words in anything imported later.
 
 #import <Foundation/Foundation.h>
@@ -47,11 +47,18 @@ NS_ASSUME_NONNULL_BEGIN
 Chan *CSPMakeChan(NSUInteger capacity);
 #define chan(...) CSPMakeChan(__VA_ARGS__ + 0)
 
-// go(f(x)) runs f(x) as a new process, on its own thread. The variables
-// in the call are captured when go runs. go({ ... }) runs a block of
-// statements the same way.
-void CSPGo(void (^block)(void));
-#define go(...) CSPGo(^{ __VA_ARGS__; })
+// go(f(x)) runs f(x) as a new process. The variables in the call are
+// captured when go runs. go({ ... }) runs a block of statements the same
+// way. Where it was started is kept for the deadlock report and the
+// ctrl-\ dump.
+void CSPGo(const char *file, int line, const char *what, void (^block)(void));
+#define go(...) CSPGo(__FILE__, __LINE__, #__VA_ARGS__, ^{ __VA_ARGS__; })
+
+// Pauses the calling process for seconds, without holding up any other.
+void sleepFor(double seconds);
+
+// Lets other processes run, for a process that computes for a long time.
+void yield(void);
 
 
 // Parcel -- carries a plain C struct over a channel. Prefer a small class;
@@ -76,9 +83,9 @@ void CSPStructFromParcel(Parcel *_Nullable parcel, void *dst, size_t size, const
 })
 
 
-// alt -- everything below is machinery for the alt macros.
+// ALT -- everything below is machinery for the ALT macros.
 //
-// alt is a loop that runs its body twice. On the first pass each case
+// ALT is a loop that runs its body twice. On the first pass each case
 // registers itself and its body is skipped. Then the library waits until
 // one case is ready and does it. On the second pass only that case's body
 // runs. Cases are told apart by their order, so every case must be reached
@@ -97,7 +104,7 @@ BOOL CSPAltAddOtherwise(CSPAlt *a, long i);
 BOOL CSPAltFire(CSPAlt *a, long i);
 id _Nullable CSPAltValue(CSPAlt *a);
 
-#define alt for (CSPAlt *_cspAlt = CSPAltBegin(); CSPAltNext(_cspAlt); )
+#define ALT for (CSPAlt *_cspAlt = CSPAltBegin(); CSPAltNext(_cspAlt); )
 
 // The case macros evaluate their channel and value only on the first pass.
 // x is declared with the channel's element type, scoped to the body.
@@ -121,7 +128,7 @@ id _Nullable CSPAltValue(CSPAlt *a);
                    ? CSPAltAddAfter(_cspAlt, _cspI, (seconds))              \
                    : CSPAltFire(_cspAlt, _cspI))
 
-#define otherwise                                                           \
+#define OTHERWISE                                                           \
     for (long _cspI = CSPAltIndex(_cspAlt); _cspI >= 0; _cspI = -1)         \
         while (CSPAltPass(_cspAlt) == 1                                     \
                    ? CSPAltAddOtherwise(_cspAlt, _cspI)                     \

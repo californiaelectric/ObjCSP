@@ -125,12 +125,6 @@ static _Atomic long nQueued;         // on the run queue; readable without the l
 static _Atomic long nSpinning;       // workers looking for work
 static long maxSpinners = 1;
 
-static void cpuRelax(void) {
-#if defined(__x86_64__)
-    __asm__ volatile("pause");
-#endif
-}
-
 static pthread_cond_t monitorCond = PTHREAD_COND_INITIALIZER;
 static _Atomic long nRunning;
 static _Atomic int monitorSleeping;
@@ -159,6 +153,15 @@ static void *getSlot(long k) {
 static void setSlot(long k, void *v) {
     __asm__ volatile("movq %0, %%gs:(,%1,8)" : : "r"(v), "r"(k) : "memory");
 }
+#elif defined(__arm64__)
+// The slots start at tpidrro_el0; its low 3 bits once held the CPU number.
+static void *volatile *slots(void) {
+    uintptr_t base;
+    __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(base));
+    return (void *volatile *)(base & ~(uintptr_t)7);
+}
+static void *getSlot(long k) { return slots()[k]; }
+static void setSlot(long k, void *v) { slots()[k] = v; }
 #else
 static void *getSlot(long k) { return NULL; }
 static void setSlot(long k, void *v) {}
@@ -390,7 +393,7 @@ static void procPark(CSPProc *p, CSPWaiter *w) {
 static void spinForClaim(CSPWaiter *w) {
     if (!schedOn) return;                        // thread mode stays as it was
     uint64_t until = nowNs() + SPIN_NS;
-    while (atomic_load(&w->fired) == -1 && nowNs() < until) cpuRelax();
+    while (atomic_load(&w->fired) == -1 && nowNs() < until) csp_relax();
 }
 
 void CSPPark(CSPWaiter *w) {
@@ -502,7 +505,7 @@ static CSPProc *procNew(void) {
     }
 
     // A first switch into the process lands in csp_start, which calls
-    // procEntry(p); see csp_x86_64.S.
+    // procEntry(p); see csp_x86_64.S and csp_arm64.S.
 #if defined(__x86_64__)
     uintptr_t *top = (uintptr_t *)(p->stack + p->mapped);
     uint32_t ctl[2];
@@ -516,6 +519,16 @@ static CSPProc *procNew(void) {
     *--top = 0;                                  // r14
     *--top = 0;                                  // r15
     *--top = ((uintptr_t)ctl[1] << 32) | ctl[0];
+    p->sp = top;
+#elif defined(__arm64__)
+    uintptr_t *top = (uintptr_t *)(p->stack + p->mapped) - 22;   // 176 bytes
+    uint64_t fpcr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    memset(top, 0, 22 * sizeof *top);            // fp 0: the bottom of the stack
+    top[0] = (uintptr_t)procEntry;               // x19
+    top[1] = (uintptr_t)p;                       // x20
+    top[11] = (uintptr_t)csp_start;              // lr
+    top[20] = fpcr;
     p->sp = top;
 #endif
     p->action = 0;
@@ -672,7 +685,7 @@ static void *workerMain(void *arg) {
             atomic_fetch_add(&nSpinning, 1);
             pthread_mutex_unlock(&schedMu);
             uint64_t until = nowNs() + SPIN_NS;
-            while (atomic_load(&nQueued) == 0 && nowNs() < until) cpuRelax();
+            while (atomic_load(&nQueued) == 0 && nowNs() < until) csp_relax();
             atomic_fetch_sub(&nSpinning, 1);
             CSPLock(&schedMu);
             if (runHead) continue;
@@ -787,7 +800,7 @@ static void onFault(int sig, siginfo_t *info, void *ctx) {
 
 // Startup
 
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(__arm64__)
 // Finds the slot holding the autorelease pool's stack, on a throwaway
 // thread so a wrong guess can only break that thread: open a pool and
 // autorelease something, then open another -- its token is an address in
@@ -825,8 +838,11 @@ static void *probePoolSlot(void *arg) {
     setSlot(found, NULL);                        // an empty pool stack of its own
     void *inner = objc_autoreleasePoolPush();
     CFAutorelease(CFBridgingRetain([NSObject new]));
+    void *other = getSlot(found);                // its page, while the pool is open
     objc_autoreleasePoolPop(inner);
-    void *other = getSlot(found);
+    // What the pop leaves: the page on macOS 12; on macOS 26 the runtime
+    // frees it, and leaves none.
+    void *left = getSlot(found);
     setSlot(found, mine);
 
     // Each pool page records the thread that made it, and the runtime
@@ -852,10 +868,10 @@ static void *probePoolSlot(void *arg) {
         pageThreadAt = threadAt;
         pageParentAt = parentAt;
         pageChildAt = childAt;
-        CSPLock(&schedMu);            // reused by the first process
+        CSPLock(&schedMu);
         capFreePools = 64;
         freePools = malloc(capFreePools * sizeof *freePools);
-        freePools[nFreePools++] = other;
+        if (left) freePools[nFreePools++] = left;          // reused by the first process
         pthread_mutex_unlock(&schedMu);
     }
     return NULL;
@@ -922,7 +938,7 @@ static void schedInit(void) {
         BOOL threads = debug && strstr(debug, "threads");
         (void)threads;                           // unused where there's no scheduler yet
 
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(__arm64__)
         if (!threads) {
             poolSlot = findPoolSlot();
             if (poolSlot >= 0)

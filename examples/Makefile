@@ -1,7 +1,7 @@
 CC     = clang
 CFLAGS = -fobjc-arc -O2 -Wall
 LDLIBS = -framework Foundation -lsqlite3
-LIB    = ../CSP.m ../CSPSched.m ../csp_x86_64.S
+LIB    = ../CSP.m ../CSPSched.m ../csp_x86_64.S ../csp_arm64.S
 
 all: verify objects
 

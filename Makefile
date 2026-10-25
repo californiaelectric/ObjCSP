@@ -8,16 +8,15 @@ all: libcsp.a csptest fanout
 # The library: what make install puts in $(PREFIX)/lib, with CSP.h in
 # $(PREFIX)/include. A client then builds with
 #     clang -fobjc-arc -o prog prog.m -lcsp -framework Foundation
-SRCS    = CSP.m CSPSched.m csp_x86_64.S
+SRCS    = CSP.m CSPSched.m csp_x86_64.S csp_arm64.S
 HDRS    = CSP.h CSPSched.h
 
-# Universal: one library for Intel and Apple Silicon Macs. (On Apple
-# Silicon it runs a thread per process until the scheduler is ported.)
+# Universal: one library for Intel and Apple Silicon Macs.
 ARCHS   = -arch x86_64 -arch arm64
 
 libcsp.a: $(SRCS) $(HDRS)
-	$(CC) $(CFLAGS) $(ARCHS) -c CSP.m CSPSched.m csp_x86_64.S
-	libtool -static -no_warning_for_no_symbols -o $@ CSP.o CSPSched.o csp_x86_64.o
+	$(CC) $(CFLAGS) $(ARCHS) -c CSP.m CSPSched.m csp_x86_64.S csp_arm64.S
+	libtool -static -no_warning_for_no_symbols -o $@ CSP.o CSPSched.o csp_x86_64.o csp_arm64.o
 
 install: libcsp.a
 	install -d $(PREFIX)/lib $(PREFIX)/include

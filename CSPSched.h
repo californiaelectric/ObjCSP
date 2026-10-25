@@ -10,15 +10,21 @@
 #import <pthread.h>
 #import <stdatomic.h>
 
+// A pause in a spin-wait: one per CPU type, in csp_x86_64.S and
+// csp_arm64.S.
+#if defined(__x86_64__) || defined(__arm64__)
+void csp_relax(void);
+#else
+static inline void csp_relax(void) {}
+#endif
+
 // Takes a lock the library holds only briefly. A busy pthread mutex puts
 // the caller to sleep in the kernel at once; these are held for well under
 // a microsecond, so try for a moment first.
 static inline void CSPLock(pthread_mutex_t *m) {
     for (int i = 0; i < 1000; i++) {
         if (pthread_mutex_trylock(m) == 0) return;
-#if defined(__x86_64__)
-        __asm__ volatile("pause");
-#endif
+        csp_relax();
     }
     pthread_mutex_lock(m);
 }

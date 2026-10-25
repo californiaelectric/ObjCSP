@@ -1,0 +1,201 @@
+ObjCSP -- instructions
+======================
+
+How to use the library, what's forbidden, and what's broken. For
+the why and the history, see words.txt.
+
+Go-style processes and channels for Objective-C. Everything a
+client uses is in CSP.h.
+
+
+Build:
+
+	make
+	sudo make install       # libcsp.a to /usr/local/lib,
+	                        # CSP.h to /usr/local/include
+
+	clang -fobjc-arc -o prog prog.m -lcsp -framework Foundation
+
+	Without installing, point at the source folder:
+
+	clang -fobjc-arc -I<ObjCSP> -o prog prog.m -L<ObjCSP> -lcsp -framework Foundation
+
+	ARC is required. The library is static: rebuild a program after
+	a new make install to pick it up.
+
+	#import "CSP.h" LAST, after every other header. ALT and
+	OTHERWISE are macros and rewrite those words in anything
+	imported after.
+
+
+In brief:
+
+	Chan<T *> *c = chan();      unbuffered      make(chan T)
+	Chan<T *> *c = chan(n);     buffered        make(chan T, n)
+	go(f(x, c));                start a process go f(x, c)
+	go([obj method:x]);         a method, too
+	go({ ... });                a block         go func() { ... }()
+	[c send:v];                                 c <- v
+	T *v = [c receive];                         v := <-c
+	[c close];                                  close(c)
+	for (T *v in c) { }                         for v := range c
+	ALT { ... }                                 select { ... }
+	sleepFor(secs);                             time.Sleep
+	yield();                                    runtime.Gosched
+
+
+Processes:
+
+	A process is an ordinary C function or method. go(...) starts
+	it. The return value is dropped -- pass a channel to get a
+	result back.
+
+	The variables in the call are captured when go runs, so a
+	process started in a loop gets that iteration's values.
+
+	A function call inside go's arguments runs in the NEW process,
+	not before it starts. go(work([c receive])) receives in the new
+	process. Do the call first, into a variable, and pass that.
+
+	go() can't capture a C array: go(f(fds[0])) won't compile.
+	Copy into a plain variable first.
+
+	Objects passed in are shared, not copied. Two processes
+	changing one object at once is a race.
+
+	When main returns, the program ends, and every process with it.
+	main must wait -- usually by receiving -- for what it needs.
+
+	Processes are cheap (~2-6 us each), but not free. Give work its
+	own process once it takes more than a few microseconds. Setting
+	a property or adding two numbers belongs in a loop.
+
+
+Channels:
+
+	Objects only. Box numbers: [c send:@(n)], [c receive].intValue.
+	For a struct, write a small class (see Structs, below).
+
+	Typed by what they carry; a mismatch is a compiler warning.
+	A bare Chan carries anything.
+
+	chan()   send waits until a receiver takes the value
+	chan(n)  send waits only when n values are already waiting
+
+	A send passes a reference. After sending an object, stop
+	changing it -- or send immutable ones.
+
+	nil can't be sent. nil from receive means closed and drained.
+
+	close means "no more values." Receivers get what's left, then
+	nil. for-in stops at close.
+
+	Several processes may for-in over one channel; each value goes
+	to exactly one of them. That's a work queue.
+
+	A reply that must stay together goes in ONE message. Two sends
+	from one process can interleave with another process's sends.
+
+	A channel of nothing (a signal): Chan<NSNull *>, send
+	[NSNull null].
+
+
+ALT:
+
+	ALT {
+	    receive(x, c)   { ... }   x is declared for you, typed from c;
+	                              nil if c is closed
+	    sending(c, v)   { ... }   v was delivered
+	    after(2.0)      { ... }   nothing else within 2 seconds
+	    OTHERWISE       { ... }   nothing ready now; ALT doesn't wait
+	}
+
+	Several ready: one is picked at random.
+	A case on a nil channel never fires -- set it to nil to switch
+	    a case off.
+	return in a body returns from the function.
+	ALT {} waits forever.
+
+
+Structs:
+
+	Channels carry objects, not structs. Where Go would send a
+	struct, write a small class with properties and send that:
+
+	    @interface Sample : NSObject
+	    @property int day;
+	    @property double weight;
+	    @end
+	    @implementation Sample
+	    @end
+
+	    Chan<Sample *> *c = chan();
+
+
+Forbidden:
+
+	sending nil
+	sending on a closed channel
+	closing a channel twice
+	importing a header after CSP.h
+	a case inside an if, or otherwise reached on only one of ALT's
+	    two passes -- every case directly inside ALT
+	break inside an ALT case to leave a surrounding loop -- it
+	    ends only the case; use a flag
+	a channel operation inside a macro argument -- MIN(x, [c
+	    receive]) receives twice
+	a channel operation inside @catch or @finally (stops the
+	    program)
+	a lock held across a channel operation (incl. @synchronized).
+	    Share by communicating instead.
+	sleep(), usleep(), [NSThread sleepForTimeInterval:] -- they
+	    hold up a whole worker. Use sleepFor().
+	depending on the current thread: [NSThread currentThread],
+	    thread-locals, NSTimer, performSelector:afterDelay: (never
+	    fires in a process). Use after and sleepFor.
+	deep recursion -- stacks are fixed at 1 MB; overflow stops the
+	    program with "process stack overflow (1 MB)"
+
+
+Allowed, though it may look wrong:
+
+	blocking calls in a process -- file reads, network. A monitor
+	    adds a worker when one is stuck.
+	reading errno right after the call that set it
+	Foundation's own locks (taken and released in one call)
+	no @autoreleasepool in a for-in worker -- each pass drains its
+	    own
+
+
+Broken or not done:
+
+	sending(c, v) doesn't type-check v. Nothing catches a wrong
+	    type there.
+	A process blocked forever on a channel nobody will use keeps
+	    its stack and objects until exit. Nothing collects it.
+	Autoreleased objects in a long while loop, or a for over an
+	    array, pile up until the process ends. Wrap the body in
+	    @autoreleasepool { }. (for-in over a channel is fine.)
+	No preemption. A long computation keeps its core; call yield()
+	    to share. Timers can fire late when every core is busy.
+	Deadlock detection doesn't count threads you start yourself,
+	    outside go(). One that would have sent to main can make main
+	    look deadlocked.
+	Per-process cost on Apple Silicon is ~3x Go's. Not yet looked
+	    into. Only matters for work of a few microseconds.
+	Untested: Intel on macOS 26, Apple Silicon on macOS 12.
+	Other CPUs: a thread per process, with macOS's 2,048 limit.
+
+
+Settings and debugging:
+
+	CSP_MAXPROCS=n       cores to use (default: all). 1 is a quick
+	                     way to ask whether a race is involved.
+	CSP_DEBUG=threads    a thread per process, so the debugger sees
+	                     them all. Debugging only; 2,048 limit.
+	CSP_DEBUG=sched      scheduler counters in the deadlock report
+
+	Deadlock: "all processes are asleep -- deadlock!", exit 2, with
+	what each waits on and where it was started.
+	ctrl-\ prints every process, what it waits on, and where it was
+	started.

@@ -10,8 +10,8 @@ cooper-go: cooper.go
 cooper-golinear: linear.go
 	go build -o $@ linear.go
 
-cooper-objcsp: cooper.m lorem.h ../CSP.m ../CSPSched.m ../csp_x86_64.S ../CSP.h ../CSPSched.h
-	$(CC) $(CFLAGS) -o $@ cooper.m ../CSP.m ../CSPSched.m ../csp_x86_64.S $(LDLIBS)
+cooper-objcsp: cooper.m lorem.h ../CSP.m ../CSPSched.m ../csp_x86_64.S ../csp_arm64.S ../CSP.h ../CSPSched.h
+	$(CC) $(CFLAGS) -o $@ cooper.m ../CSP.m ../CSPSched.m ../csp_x86_64.S ../csp_arm64.S $(LDLIBS)
 
 cooper-linear: linear.m lorem.h
 	$(CC) $(CFLAGS) -o $@ linear.m $(LDLIBS)
@@ -19,14 +19,14 @@ cooper-linear: linear.m lorem.h
 models-go: models.go
 	go build -o $@ models.go
 
-models-objcsp: models.m ../CSP.m ../CSPSched.m ../csp_x86_64.S ../CSP.h ../CSPSched.h
-	$(CC) $(CFLAGS) -o $@ models.m ../CSP.m ../CSPSched.m ../csp_x86_64.S $(LDLIBS)
+models-objcsp: models.m ../CSP.m ../CSPSched.m ../csp_x86_64.S ../csp_arm64.S ../CSP.h ../CSPSched.h
+	$(CC) $(CFLAGS) -o $@ models.m ../CSP.m ../CSPSched.m ../csp_x86_64.S ../csp_arm64.S $(LDLIBS)
 
 docs-go: docs.go
 	go build -o $@ docs.go
 
-docs-objcsp: docs.m ../CSP.m ../CSPSched.m ../csp_x86_64.S ../CSP.h ../CSPSched.h
-	$(CC) $(CFLAGS) -o $@ docs.m ../CSP.m ../CSPSched.m ../csp_x86_64.S $(LDLIBS)
+docs-objcsp: docs.m ../CSP.m ../CSPSched.m ../csp_x86_64.S ../csp_arm64.S ../CSP.h ../CSPSched.h
+	$(CC) $(CFLAGS) -o $@ docs.m ../CSP.m ../CSPSched.m ../csp_x86_64.S ../csp_arm64.S $(LDLIBS)
 
 # The documents for docs-go and docs-objcsp.
 data: gen_docs.py

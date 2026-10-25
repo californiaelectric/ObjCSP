@@ -1,6 +1,6 @@
-// csp_x86_64.S -- the context switch, for Intel Macs. Each CPU type gets
-// its own; on others this file is empty and the library runs a thread
-// per process.
+// csp_x86_64.S -- the context switch and the spin hint, for Intel Macs.
+// Each CPU type gets its own; on others this file is empty and the
+// library runs a thread per process.
 
 #if defined(__x86_64__)
 
@@ -47,5 +47,12 @@ _csp_start:
         callq   *%r13
         ud2
         .cfi_endproc
+
+// csp_relax(): a pause in a spin-wait.
+        .globl  _csp_relax
+        .p2align 4
+_csp_relax:
+        pause
+        ret
 
 #endif

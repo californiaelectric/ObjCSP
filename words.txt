@@ -8,12 +8,12 @@ The goal: push the complexity into the library. A client source
 file should read as plainly as Go -- easily read process
 definitions, easily read invocations, no block syntax.
 
-Status, 2026-10-18: built, with the scheduler -- processes are
+Status, 2026-10-19: built, with the scheduler -- processes are
 coroutines run by one worker thread per core. The first version,
-one thread per process, remains as CSP_DEBUG=threads. Intel Macs
-only for the scheduler so far; other CPUs run a thread per
-process. Installed as a library. What is tested is listed under
-Verified, at the end.
+one thread per process, remains as CSP_DEBUG=threads. The
+scheduler runs on Intel and Apple Silicon Macs; other CPUs run a
+thread per process. Installed as a library. What is tested is
+listed under Verified, at the end.
 
 
 Files:
@@ -22,7 +22,8 @@ Files:
 	CSP.m          channels, ALT, Parcel
 	CSPSched.h     internal: how a waiting process sleeps and wakes
 	CSPSched.m     the scheduler, and the thread-per-process fallback
-	csp_x86_64.S   the context switch, for Intel
+	csp_x86_64.S   the context switch and the spin hint, for Intel
+	csp_arm64.S    the same, for Apple Silicon
 	test.m         the tests: make check builds and runs csptest;
 	               make tsan, the same under the race checker
 	fanout.m       a distributed worker written as a client
@@ -36,8 +37,7 @@ Files:
 
 	The deliverable is a static library, libcsp.a, and its header,
 	CSP.h. The library is universal -- one file for Intel and Apple
-	Silicon Macs; on Apple Silicon it runs a thread per process
-	until the scheduler is ported there. Build and install once:
+	Silicon Macs. Build and install once:
 
 	    make
 	    sudo make install       # libcsp.a to /usr/local/lib,
@@ -569,6 +569,57 @@ Performance, 2026-10-18:
 	        at once                               ~11 -> 6.3 ms
 	    the benchmark's random spots made fixed   6.3 -> 5.5 ms
 
+	On Apple Silicon, 2026-10-19 -- an M5 Max, 18 cores in two
+	performance levels (6 and 12), macOS 26.4; Go 1.19. The same
+	benchmarks, the same way (the shell again had MallocNanoZone=0).
+	COOPER's four versions give the same 1,000 blocks; the two
+	straight lines match byte for byte, the concurrent ones differ
+	only in the order the blocks arrive.
+
+	                         MacBook Air    M5 Max
+	    COOPER
+	      Go, goroutines       1.9 ms       2.45 ms
+	      Go, linear           0.6 ms       0.31 ms
+	      ObjCSP               5.5 ms       6.01 ms
+	      ObjC, linear         3.6 ms       0.28 ms
+	    Models
+	      ObjCSP               180 ms       23.1 ms   13.8x over linear
+	      ObjCSP, threads      206 ms       24.8 ms
+	      ObjC, linear        1066 ms        319 ms
+	    Documents
+	      ObjCSP              1032 ms       98.5 ms   11.1x over linear
+	      ObjC, linear        2593 ms       1095 ms
+	    verify
+	      csp                 0.03 s        0.026 s   (921 and 79, as before)
+	      linear              12.4 s        12.6 s
+	    objects, 10,000 steps
+	      processes          0.063 s        0.050 s   2.9x over the loop
+	      loop               0.289 s        0.144 s
+
+	(Go's models and documents were not run here.)
+
+	Real work scales: models gets about 77% of a perfect 18x, and
+	documents -- 2.5x on the Air, blamed there on Foundation --
+	11.1x. Waiting is bound by the waits, on either Mac. Foundation's
+	string work is 13x faster here: ObjC's straight-line COOPER now
+	matches Go's.
+
+	That leaves COOPER as almost nothing but the cost per process --
+	its time less its straight line, over 1,000 processes:
+
+	                         MacBook Air    M5 Max, 18    M5 Max, 6
+	    Go                     1.3 us         2.0 us        0.9 us
+	    ObjCSP                 1.9 us         5.8 us        2.9 us
+
+	Both halve from 18 cores to 6 (GOMAXPROCS, CSP_MAXPROCS): on
+	this Mac, spreading work this small over every core costs any
+	runtime about twice as much. But ObjCSP costs about 3x what Go
+	does at either count, against 1.5x on the Air. That gap is
+	ObjCSP's own, and not yet looked into. It matters only where
+	each piece of work is a few microseconds: objects gains 2.9x
+	over its loop here against 4.6x on the Air, and the crossover
+	-- a few microseconds on the Air -- is probably higher here.
+
 
 The scheduler, 2026-10-18 -- built:
 
@@ -592,8 +643,8 @@ The scheduler, 2026-10-18 -- built:
 
 	context switch   save one process's registers and stack
 	                 pointer, load another's. Hand-written per CPU
-	                 type -- ~20 lines on Intel; Apple Silicon gets
-	                 its own. Not ucontext: deprecated, and a kernel
+	                 type -- ~20 lines on Intel, ~30 on Apple
+	                 Silicon. Not ucontext: deprecated, and a kernel
 	                 call per switch.
 
 	stacks           1 MB per process, reserved address space --
@@ -746,7 +797,12 @@ Settings:
 	                     1 is a quick way to ask whether a race
 	                     is involved.
 	CSP_DEBUG=threads    a thread per process, the first version
-	                     -- for debugging, not for running
+	                     -- for debugging, not for running. A
+	                     program with more than 2,048 processes
+	                     alive at once stops at macOS's thread
+	                     limit ("go: can't start a process"):
+	                     bench's documents and examples/objects.m
+	                     can't run this way.
 	CSP_DEBUG=sched      adds the scheduler's counters to the
 	                     deadlock report
 
@@ -817,8 +873,40 @@ Building it -- order, all done 2026-10-18:
 	    defines MIN to evaluate its arguments twice. Never put a
 	    channel operation inside a macro argument.
 
-	Apple Silicon next: its own switch, slot access and stack setup
-	-- a few dozen lines; everything else shared.
+	Apple Silicon, 2026-10-19 -- built. csp_arm64.S has the switch,
+	the first code a process runs, and the spin hint; CSPSched.m has
+	the slot access and stack setup. Everything else is shared. On
+	an M5 Max, 18 cores in two performance levels (6 and 12), macOS
+	26.4:
+
+	the switch     saves what an arm64 call preserves: x19-x28, fp,
+	               lr, the low halves of d8-d15, and FPCR -- 176
+	               bytes. x18 is Apple's, never touched.
+	thread slots   start at tpidrro_el0, its low 3 bits masked (they
+	               once held the CPU number). The pool is in slot 43,
+	               as on Intel.
+	spin hint      csp_relax(), one per CPU type in its .S file.
+	               Apple's cores treat yield, the instruction meant
+	               for this, as a no-op; isb waits about 8 ns, as
+	               pause does on Intel. With no hint, CSPLock's 1,000
+	               tries were over in about 1 us.
+
+	What porting it found:
+
+	the library had never linked on Apple Silicon: the switch was
+	    called with no CPU guard, and nothing defined it there. The
+	    thread per process promised for Apple Silicon until the
+	    port never ran.
+	the startup probe's swap test failed on macOS 26. After the
+	    swapped-in stack's only pool was popped, macOS 12 (Intel)
+	    left its page there; macOS 26 (Apple Silicon) frees it and
+	    leaves the slot empty, which the probe read as a failed
+	    swap. It now checks the swapped-in stack while the pool is
+	    open, and reuses what the pop leaves only if anything is.
+
+	Not tested: Intel on macOS 26 (no Rosetta here) and Apple
+	Silicon on macOS 12. The probe should work on both -- it accepts
+	either behavior -- but neither has been run.
 
 
 Memory, 2026-10-18:
@@ -874,7 +962,9 @@ Known limits:
 
 Verified, 2026-10-18 (test.m, 72 checks, on the scheduler at 1 and 8
 workers and with CSP_DEBUG=threads (58 apply there); clean under
-ThreadSanitizer):
+ThreadSanitizer). Again 2026-10-19 on Apple Silicon (M5 Max, macOS
+26.4): at 1, 2 and 18 workers, 30 more runs at 2 and 18 without a
+failure, and clean under ThreadSanitizer:
 
 	unbuffered send waits for the receiver
 	buffered channels: FIFO order, capacity

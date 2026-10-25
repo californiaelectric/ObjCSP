@@ -1,0 +1,65 @@
+ObjCSP -- to do
+===============
+
+What still needs doing. When something is done, delete its section --
+the record of how belongs in words.txt and the git log, not here.
+The goal is an empty file. Numbers stay with their items: a deleted
+one leaves a gap, and a new one takes the next number. The order
+is the order to do them in.
+
+
+1. PAR
+
+	A block that starts each of its statements as a process and
+	continues only when all have finished -- occam's PAR. go stays as
+	it is.
+
+
+2. Callback wrappers
+
+	Apple APIs that answer through a completion block (and Swift-only
+	APIs, through a small @objc Swift shim) should be reachable as plain
+	functions that wait on a channel inside a process -- no ^{ } in
+	client code. Work out the pattern, write one or two real ones, and
+	document how to write more.
+
+
+3. Deadlock detection and the program's own threads
+
+	Threads a program starts itself, outside go(), aren't counted, so
+	main can be reported deadlocked when one of them would still have
+	sent to it. Count them, or say clearly when the report can't be
+	trusted.
+
+
+4. sending(c, v) is not type-checked
+
+	A wrong type for v in an ALT sending case goes unnoticed. Make the
+	compiler check it, as it does for send:.
+
+
+5. Timer coalescing
+
+	Let macOS group nearby timer deadlines (a little slack, ~1 ms) so
+	many sleeping processes wake the CPU once. Planned in Energy, not
+	done.
+
+
+6. Cost per process on Apple Silicon
+
+	About 3x Go's there (5.8 us against 2.0 at 18 cores), against 1.5x
+	on Intel. Find out why on an Apple Silicon Mac -- spin hint, locks,
+	the single run queue -- and close what can be closed.
+
+
+7. Fast or efficient cores
+
+	On Apple Silicon, workers inherit main's quality of service, which
+	decides performance or efficiency cores. A setting to choose --
+	efficiency cores for batch work, at much less power.
+
+
+8. Untested combinations
+
+	Intel on macOS 26, and Apple Silicon on macOS 12. The startup probe
+	accepts both pool behaviors, but neither has been run.
